@@ -228,6 +228,9 @@ def now_local():
 
 
 def in_quiet(dt):
+    # QUIET_HOURS=off disables the quiet window (for testing at night)
+    if env("QUIET_HOURS").lower() in ("off", "0", "false", "no"):
+        return False
     return dt.hour >= QUIET_START or dt.hour < QUIET_END
 
 
