@@ -29,6 +29,7 @@ Modes:
     (none)    loop forever
 """
 import argparse
+import faulthandler
 import hashlib
 import html
 import json
@@ -36,6 +37,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -45,6 +47,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 BASE = Path(__file__).resolve().parent
+
+try:  # show log lines immediately (a hung run would otherwise show nothing)
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 
 # ================================================================ config
@@ -101,6 +109,10 @@ try:
     RUN_BUDGET = int(env("RUN_BUDGET", "300"))
 except ValueError:
     RUN_BUDGET = 300
+try:  # hard limit: a run that is still alive after this is force-killed
+    HARD_TIMEOUT = int(env("HARD_TIMEOUT", str(RUN_BUDGET + 180)))
+except ValueError:
+    HARD_TIMEOUT = RUN_BUDGET + 180
 
 
 # ================================================================ pages
@@ -460,6 +472,7 @@ def fetch_pages(cookie_list, pages, debug=False):
         browser = p.chromium.launch(
             channel=env("BROWSER_CHANNEL") or None,
             headless=True,
+            timeout=60000,
             args=["--no-sandbox",
                   "--disable-dev-shm-usage",
                   "--disable-gpu",
@@ -472,6 +485,8 @@ def fetch_pages(cookie_list, pages, debug=False):
                 viewport={"width": 1366, "height": 900},
                 user_agent=USER_AGENT,
             )
+            ctx.set_default_timeout(30000)
+            ctx.set_default_navigation_timeout(45000)
             ctx.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
             if not debug:  # keep screenshots intact in debug mode
@@ -649,8 +664,30 @@ def _run(test, t0):
 RUN_FLAG = _state_dir / "running.flag"
 
 
+def _watchdog_fire():
+    """The run is hung (e.g. Chromium froze). Cron would skip every later
+    schedule while this process is alive, so tell the owner and exit hard."""
+    print(f"WATCHDOG: run exceeded {HARD_TIMEOUT}s - killing the process.")
+    try:
+        RUN_FLAG.unlink()
+    except Exception:
+        pass
+    try:
+        alert_throttled("hang", f"⏱ A run hung for more than {HARD_TIMEOUT}s and was "
+                                "force-stopped so the next cron runs are not blocked. "
+                                "If this repeats, check Railway Metrics (memory).",
+                        hours=1)
+    except Exception:
+        pass
+    os._exit(3)
+
+
 def run_once(test=False):
     t0 = time.time()
+    watchdog = threading.Timer(HARD_TIMEOUT, _watchdog_fire)
+    watchdog.daemon = True
+    watchdog.start()
+    faulthandler.dump_traceback_later(max(10, HARD_TIMEOUT - 5), exit=False)
     if RUN_FLAG.exists():  # the previous run never reached its end
         alert("The previous run did not finish: the process was probably killed "
               "(out of memory, timeout or a redeploy). If it repeats, check "
@@ -664,6 +701,8 @@ def run_once(test=False):
     except Exception as e:
         register_failure(load_state(), f"{type(e).__name__}: {str(e)[:150]}", t0)
     finally:
+        watchdog.cancel()
+        faulthandler.cancel_dump_traceback_later()
         try:
             RUN_FLAG.unlink()
         except Exception:
