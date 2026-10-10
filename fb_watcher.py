@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """
-Facebook page -> Telegram watcher (Playwright + cookies).
-Optimized for Railway Cron (one short run every 20 min, then exit).
+Facebook pages -> Telegram watcher (Playwright + cookies), multi-page.
+Optimized for Railway Cron (one short run, then exit).
 
 Env vars:
-    TG_TOKEN, TG_CHAT_ID, FB_PAGE_ID, FB_COOKIES (or cookies.txt),
-    TG_OWNER_ID (optional), FB_USER_AGENT (optional), BOT_TZ (default Africa/Cairo),
-    STATE_DIR (folder for state.json - point it to the Railway Volume, e.g. /data)
+    TG_TOKEN, TG_CHAT_ID, FB_COOKIES (or cookies.txt)
+    FB_PAGES  one or more pages, separated by new lines, commas or ';'
+              each item:  page  or  page|chat_id  or  page|chat_id|label
+              page    = numeric id, username, or full facebook URL
+              chat_id = (optional) send this page to a different channel
+              label   = (optional) name shown above the post (default: page)
+              examples:  100064825534678
+                         somepage|@my_channel|Some Page
+    FB_PAGE_ID  old single-page variable, still works if FB_PAGES is empty
+    TG_OWNER_ID (optional), FB_USER_AGENT (optional), BOT_TZ (default Africa/Cairo)
+    STATE_DIR   folder for state.json - point it to the Railway Volume (e.g. /data)
+    QUIET_HOURS=off   disable the 22:00-08:00 quiet window (testing)
+    RUN_BUDGET        max seconds per run before skipping remaining pages (default 300)
+    REPORT_ALWAYS=1   owner report after every run (default: only when something happened)
 
 Modes:
-    --cron    ONE check then exit (Railway Cron). Only quiet hours/blocked are checked.
+    --cron    ONE run over all pages, then exit (Railway Cron)
     --gate    decide if a check is due (no browser) -> GITHUB_OUTPUT
     --once    run one check now (ignores the schedule)
-    --test    with --once/--cron: send "bot is up" + the latest post
-    --debug   diagnose only: no Telegram, saves debug.png / debug.html
+    --test    with --once/--cron: send the latest post of the first page
+    --debug   diagnose only: no Telegram, saves debug_N.png / debug_N.html
     (none)    loop forever
 """
 import argparse
@@ -58,7 +69,7 @@ STATE_FILE = _state_dir / "state.json"
 # ---- قيم للتجربة في ريبو خاص فقط (لو فاضية، بيقرأ من Variables / .env) ----
 LOCAL_TOKEN = ""
 LOCAL_CHAT_ID = ""
-LOCAL_PAGE_ID = ""
+LOCAL_PAGES = ""        # مثال: "100064825534678, otherpage|@chan|Name"
 LOCAL_COOKIES = r"""
 """
 # --------------------------------------------------------------------
@@ -71,7 +82,6 @@ def env(name, default=""):
 TOKEN = env("TG_TOKEN", LOCAL_TOKEN)
 CHAT_ID = env("TG_CHAT_ID", LOCAL_CHAT_ID)
 OWNER_ID = env("TG_OWNER_ID")
-PAGE_ID = env("FB_PAGE_ID", LOCAL_PAGE_ID)
 TZ = ZoneInfo(env("BOT_TZ", "Africa/Cairo"))
 USER_AGENT = env(
     "FB_USER_AGENT",
@@ -80,16 +90,50 @@ USER_AGENT = env(
 )
 
 QUIET_START, QUIET_END = 22, 8          # no requests from 22:00 to 08:00
-CHECK_GAP = 20 * 60                     # gap between checks (seconds)
+CHECK_GAP = 20 * 60                     # gap between runs (seconds)
 GATE_TOLERANCE = 10 * 60
-MAX_POSTS = 10
-MAX_FAILS = 3
+MAX_POSTS = 10                          # newest posts read per page
+MAX_FAILS = 3                           # consecutive failures before stopping/alerting
+SEEN_KEEP = 200                         # remembered post ids per page
+try:
+    RUN_BUDGET = int(env("RUN_BUDGET", "300"))
+except ValueError:
+    RUN_BUDGET = 300
 
 
-def page_url():
-    if PAGE_ID.isdigit():
-        return f"https://www.facebook.com/profile.php?id={PAGE_ID}"
-    return f"https://www.facebook.com/{PAGE_ID}"
+# ================================================================ pages
+def page_url(spec):
+    if spec.lower().startswith("http"):
+        return spec
+    if spec.isdigit():
+        return f"https://www.facebook.com/profile.php?id={spec}"
+    return f"https://www.facebook.com/{spec.strip('/')}"
+
+
+def parse_pages():
+    """FB_PAGES = 'page', 'page|chat_id' or 'page|chat_id|label' items."""
+    raw = env("FB_PAGES") or env("FB_PAGE_ID") or LOCAL_PAGES
+    pages, keys = [], set()
+    for item in re.split(r"[\n,;]+", raw):
+        item = item.strip()
+        if not item:
+            continue
+        parts = [x.strip() for x in item.split("|")]
+        spec = parts[0]
+        if not spec or spec in keys:
+            continue
+        keys.add(spec)
+        short = re.sub(r"^https?://(www\.|m\.)?facebook\.com/", "", spec).strip("/")
+        pages.append({
+            "key": spec,
+            "url": page_url(spec),
+            "chat": (parts[1] if len(parts) > 1 and parts[1] else CHAT_ID),
+            "label": (parts[2] if len(parts) > 2 and parts[2] else short),
+        })
+    return pages
+
+
+PAGES = parse_pages()
 
 
 def get_raw_cookies():
@@ -165,7 +209,11 @@ def normalize_cookies(cookies):
 
 
 # ================================================================ telegram
+LAST_TG_ERROR = ""
+
+
 def tg(method, **payload):
+    global LAST_TG_ERROR
     data = urllib.parse.urlencode(payload).encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{TOKEN}/{method}", data=data)
@@ -173,23 +221,31 @@ def tg(method, **payload):
         with urllib.request.urlopen(req, timeout=30) as r:
             return r.status == 200
     except urllib.error.HTTPError as e:
-        print("Telegram error:", e.code)
+        try:
+            body = e.read().decode("utf-8", "ignore")[:150]
+        except Exception:
+            body = ""
+        LAST_TG_ERROR = f"HTTP {e.code} {body}".strip()
+        print("Telegram error:", LAST_TG_ERROR)
         return False
     except Exception as e:
-        print("Telegram error:", type(e).__name__)
+        LAST_TG_ERROR = type(e).__name__
+        print("Telegram error:", LAST_TG_ERROR)
         return False
 
 
-def send_post(post):
+def send_post(post, page):
     text = post["text"] or "(post without text)"
     if len(text) > 3000:
         text = text[:3000] + "…"
-    caption = f"{text}\n\n{post['url']}"
+    head = f"📌 {page['label']}\n\n" if len(PAGES) > 1 else ""
+    caption = f"{head}{text}\n\n{post['url']}"
+    chat = page["chat"]
     if post["images"]:
-        if tg("sendPhoto", chat_id=CHAT_ID, photo=post["images"][0],
+        if tg("sendPhoto", chat_id=chat, photo=post["images"][0],
               caption=caption[:1024]):
             return True
-    return tg("sendMessage", chat_id=CHAT_ID, text=caption)
+    return tg("sendMessage", chat_id=chat, text=caption)
 
 
 def notify(msg):
@@ -201,7 +257,26 @@ def notify(msg):
 
 
 def alert(msg):
-    tg("sendMessage", chat_id=OWNER_ID or CHAT_ID, text=f"ALERT: {msg}")
+    tg("sendMessage", chat_id=OWNER_ID or CHAT_ID, text=f"🚨 ALERT: {msg}")
+
+
+def alert_throttled(key, msg, hours=6):
+    """Same alert at most once every `hours` (avoids a message every 20 min)."""
+    f = _state_dir / "alerts.json"
+    try:
+        sent = json.loads(f.read_text()) if f.exists() else {}
+    except Exception:
+        sent = {}
+    now = time.time()
+    if now - sent.get(key, 0) < hours * 3600:
+        print("[alert suppressed]", msg.replace("\n", " | "))
+        return
+    sent[key] = now
+    try:
+        f.write_text(json.dumps(sent))
+    except Exception:
+        pass
+    alert(msg)
 
 
 # ================================================================ state
@@ -210,13 +285,20 @@ def load_state():
         try:
             return json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            try:
+                STATE_FILE.replace(STATE_FILE.with_suffix(".bad"))
+            except Exception:
+                pass
+            alert("state.json was corrupted. The bot started from scratch (backup "
+                  "saved as state.json.bad). Pages will be re-learned silently, "
+                  "so no old posts are re-sent.")
     return {}
 
 
 def save_state(st):
-    if st.get("seen"):
-        st["seen"] = st["seen"][-300:]
+    for ps in st.get("pages", {}).values():
+        if ps.get("seen"):
+            ps["seen"] = ps["seen"][-SEEN_KEEP:]
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(st), encoding="utf-8")
     tmp.replace(STATE_FILE)  # atomic write
@@ -353,11 +435,21 @@ def extract_posts(page_html):
 
 # ================================================================ browser
 BLOCKED_TYPES = {"image", "media", "font"}   # not needed: we parse the JSON
+LOGIN_MARKS = ("login", "checkpoint", "two_step", "recover", "disabled")
 
 
-def fetch_page(cookie_list, debug=False):
+def url_is_blocked(url):
+    low = url.lower()
+    return any(x in low for x in LOGIN_MARKS)
+
+
+def fetch_pages(cookie_list, pages, debug=False):
+    """One browser, one session, all pages one after the other.
+    Returns (results, cookies, session_ok). results = [{page, content, error}]."""
     from playwright.sync_api import sync_playwright  # lazy: gate needs no deps
 
+    results, cookies, session = [], [], True
+    started = time.time()
     time.sleep(random.uniform(1, 4))
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -382,28 +474,38 @@ def fetch_page(cookie_list, debug=False):
                           if r.request.resource_type in BLOCKED_TYPES
                           else r.continue_())
             ctx.add_cookies(cookie_list)
-            page = ctx.new_page()
-            page.goto(page_url(), wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(random.randint(3000, 5000))
-            for _ in range(2):
-                page.mouse.wheel(0, random.randint(900, 1600))
-                page.wait_for_timeout(random.randint(1200, 2200))
-            content = page.content()
-            final_url = page.url
+            tab = ctx.new_page()
+            for i, pg in enumerate(pages):
+                if i:
+                    if time.time() - started > RUN_BUDGET:
+                        print(f"Run budget ({RUN_BUDGET}s) reached; "
+                              f"skipping {len(pages) - i} page(s) until next run.")
+                        break
+                    time.sleep(random.uniform(3, 7))
+                try:
+                    tab.goto(pg["url"], wait_until="domcontentloaded", timeout=60000)
+                    tab.wait_for_timeout(random.randint(3000, 5000))
+                    if url_is_blocked(tab.url):
+                        session = False
+                        break
+                    for _ in range(2):
+                        tab.mouse.wheel(0, random.randint(900, 1600))
+                        tab.wait_for_timeout(random.randint(1200, 2200))
+                    content = tab.content()
+                    if debug:
+                        tab.screenshot(path=str(BASE / f"debug_{i + 1}.png"))
+                        (BASE / f"debug_{i + 1}.html").write_text(
+                            content, encoding="utf-8")
+                    results.append({"page": pg, "content": content, "error": None})
+                except Exception as e:
+                    results.append({"page": pg, "content": None,
+                                    "error": f"{type(e).__name__}: {str(e)[:100]}"})
             cookies = ctx.cookies("https://www.facebook.com")
-            if debug:
-                page.screenshot(path=str(BASE / "debug.png"))
-                (BASE / "debug.html").write_text(content, encoding="utf-8")
         finally:
             browser.close()
-    return content, final_url, cookies
-
-
-def session_ok(final_url, cookies):
-    low = final_url.lower()
-    if any(x in low for x in ("login", "checkpoint", "two_step", "recover", "disabled")):
-        return False
-    return "c_user" in {c["name"] for c in cookies}
+    if "c_user" not in {c["name"] for c in cookies}:
+        session = False
+    return results, cookies, session
 
 
 # ================================================================ runs
@@ -418,9 +520,7 @@ def register_failure(st, reason, t0=None):
               f"Last reason: {reason}\n"
               "After fixing the problem, update FB_COOKIES (or set RESET=1 once).")
     else:
-        notify(f"Check failed ({st['fails']}/{MAX_FAILS}).\n"
-               f"Page: {PAGE_ID}\n{page_url()}\n"
-               f"Reason: {reason}")
+        notify(f"⚠️ Run failed ({st['fails']}/{MAX_FAILS}).\nReason: {reason}")
     st["next_due"] = plan_next(t0)
     save_state(st)
 
@@ -437,91 +537,128 @@ def block(st, reason, t0=None):
 
 def _run(test, t0):
     st = load_state()
+    st.pop("seen", None)  # legacy single-page key (now stored per page)
     if os.environ.get("RESET") == "1" or st.get("cookie_hash") != cookie_hash():
         st.update({"blocked": False, "fails": 0, "cookies": None,
                    "cookie_hash": cookie_hash()})
         st.pop("block_reason", None)
+        for ps in st.get("pages", {}).values():
+            ps["fails"] = 0
+    pstate = st.setdefault("pages", {})
+
+    # least recently checked first, so a time-limited run never starves a page
+    order = sorted(PAGES, key=lambda p: pstate.get(p["key"], {}).get("last_check", 0))
 
     cookie_list = st.get("cookies") or parse_cookies(get_raw_cookies())
-    content, final_url, cookies = fetch_page(cookie_list)
+    results, cookies, session = fetch_pages(cookie_list, order)
 
-    if not session_ok(final_url, cookies):
+    if not session:
         return block(st, "Cookies expired or Facebook asked for login / identity "
                          "confirmation (checkpoint).", t0)
 
-    posts, _, _ = extract_posts(content)
-    posts = posts[:MAX_POSTS]
-    if not posts:
+    ok_pages, test_done = 0, False
+    lines, new_total = [], 0
+    for r in results:
+        pg = r["page"]
+        ps = pstate.setdefault(pg["key"], {})
+        ps["last_check"] = int(time.time())
+
+        posts = []
+        reason = r["error"]
+        if not reason:
+            posts = extract_posts(r["content"])[0][:MAX_POSTS]
+            if not posts:
+                reason = "no posts could be read from the page"
+        if reason:
+            ps["fails"] = ps.get("fails", 0) + 1
+            print(f"[{pg['label']}] failure #{ps['fails']}: {reason}")
+            lines.append(f"- ⚠️ {pg['label']}: FAILED {ps['fails']}/{MAX_FAILS} ({reason})")
+            if ps["fails"] == MAX_FAILS:
+                alert(f"Page '{pg['label']}' failed {MAX_FAILS} times in a row.\n"
+                      f"{pg['url']}\nLast reason: {reason}\n"
+                      "The bot keeps trying it on every run.")
+            continue
+
+        ok_pages += 1
+        ps["fails"] = 0
+        seen = ps.get("seen")
+        if seen is None:  # first time we see this page: remember, send nothing
+            seen = ps["seen"] = [p["id"] for p in reversed(posts)]
+            notify(f"🟢 Page activated: {pg['label']}\n{pg['url']}\n"
+                   f"Saved {len(posts)} current posts without sending them.\n"
+                   f"Only new posts will be sent to {pg['chat']} from now on.")
+            if not (test and not test_done):
+                continue
+        if test and not test_done:
+            test_done = True
+            notify(f"Test: sending the latest post of {pg['label']}...")
+            if send_post(posts[0], pg):
+                if posts[0]["id"] not in seen:
+                    seen.append(posts[0]["id"])
+            else:
+                notify("The test post could not be sent.")
+
+        seen_set = set(seen)
+        new = [p for p in posts if p["id"] not in seen_set]
+        sent = 0
+        for p in sorted(new, key=lambda x: x["ts"]):  # oldest first
+            if send_post(p, pg):
+                seen.append(p["id"])
+                sent += 1
+                time.sleep(random.uniform(1, 3))
+        ps["seen"] = seen
+        new_total += len(new)
+        line = f"- {pg['label']}: {len(posts)} read, {len(new)} new, {sent} sent"
+        if sent < len(new):
+            line += (f" ({len(new) - sent} will retry next run; "
+                     f"Telegram: {LAST_TG_ERROR or 'unknown error'})")
+        lines.append(line)
+
+    if results and ok_pages == 0:
         return register_failure(
-            st, "Session is valid but no posts could be read from the page.", t0)
+            st, "Session is valid but no page could be read.", t0)
 
-    st["cookies"] = normalize_cookies(cookies)
-
-    seen = st.get("seen")
-    first_run = seen is None
-    if first_run:
-        st["seen"] = [p["id"] for p in reversed(posts)]
-        seen = st["seen"]
-        notify(f"Bot activated. Saved {len(posts)} current posts without sending "
-               f"them.\nPage: {PAGE_ID}\n{page_url()}\n"
-               "From now on only new posts will be sent to the channel.")
-    if test:
-        notify("Bot is running. Sending the latest post to the channel as a test...")
-        if send_post(posts[0]):
-            if posts[0]["id"] not in seen:
-                seen.append(posts[0]["id"])
-        else:
-            notify("The test post could not be sent to the channel.")
-    seen_set = set(seen)
-    new = [p for p in posts if p["id"] not in seen_set]
-    sent = []
-    for p in sorted(new, key=lambda x: x["ts"]):
-        if send_post(p):
-            seen.append(p["id"])
-            sent.append(p)
-            time.sleep(random.uniform(1, 3))
-    st["seen"] = seen
-
+    st["cookies"] = normalize_cookies(cookies)  # keep the session fresh
     st["fails"] = 0
     st["next_due"] = plan_next(t0)
     st["last_ok"] = int(time.time())
     save_state(st)
     nd = datetime.fromtimestamp(st["next_due"], TZ)
-    print(f"Checked OK: {len(new)} new post(s). Next check about {nd:%H:%M}")
+    print(f"Run OK: {ok_pages}/{len(order)} page(s) read, {new_total} new post(s).")
 
-    if first_run:
+    has_failed = any("FAILED" in l for l in lines)
+    if new_total == 0 and not has_failed and env("REPORT_ALWAYS") != "1":
         return
-    # Only message the owner when something happened (saves nothing in credits
-    # but avoids 40+ chat messages per day). Set REPORT_ALWAYS=1 to get every check.
-    if not new and env("REPORT_ALWAYS") != "1":
-        return
-    report = (f"Page checked: {PAGE_ID}\n{page_url()}\n"
-              f"Time: {now_local():%Y-%m-%d %H:%M} ({TZ.key})\n"
-              f"Posts read: {len(posts)}\n")
-    if not new:
-        report += "Result: no new posts.\n"
-    else:
-        report += (f"Result: found {len(new)} new post(s), "
-                   f"sent {len(sent)} to the channel.\n")
-        for p in sent:
-            report += f"- {p['url']}\n"
-        if len(sent) < len(new):
-            report += (f"{len(new) - len(sent)} post(s) could not be sent and will "
-                       "be retried on the next check.\n")
-    report += f"Next check: about {nd:%H:%M}"
-    notify(report)
+    notify(f"Run report ({now_local():%Y-%m-%d %H:%M} {TZ.key})\n"
+           + "\n".join(lines) + f"\nNext run: about {nd:%H:%M}")
+
+
+RUN_FLAG = _state_dir / "running.flag"
 
 
 def run_once(test=False):
     t0 = time.time()
+    if RUN_FLAG.exists():  # the previous run never reached its end
+        alert("The previous run did not finish: the process was probably killed "
+              "(out of memory, timeout or a redeploy). If it repeats, check "
+              "Railway Metrics/Logs.")
+    try:
+        RUN_FLAG.write_text(str(int(t0)))
+    except Exception:
+        pass
     try:
         _run(test, t0)
     except Exception as e:
         register_failure(load_state(), f"{type(e).__name__}: {str(e)[:150]}", t0)
+    finally:
+        try:
+            RUN_FLAG.unlink()
+        except Exception:
+            pass
 
 
 def run_cron(test=False):
-    """Railway Cron entry: one check, then the process exits (stops billing)."""
+    """Railway Cron entry: one run, then the process exits (stops billing)."""
     ok, why = should_run(load_state(), ignore_due=True)
     print(f"cron: run={ok} ({why}) local={now_local():%H:%M}")
     if ok:
@@ -529,17 +666,21 @@ def run_cron(test=False):
 
 
 def run_debug():
-    content, final_url, cookies = fetch_page(parse_cookies(get_raw_cookies()), debug=True)
-    print("URL after load :", final_url)
-    print("Session OK     :", session_ok(final_url, cookies))
-    posts, stories, blobs = extract_posts(content)
-    print("JSON blobs     :", blobs)
-    print("Story nodes    :", stories)
-    print("Posts parsed   :", len(posts))
-    for p in posts[:MAX_POSTS]:
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(p["ts"]))
-        print(f"- {when} | {p['id']} | {p['text'][:60]!r} | imgs={len(p['images'])}")
-    print("Saved debug.png and debug.html")
+    results, cookies, session = fetch_pages(
+        parse_cookies(get_raw_cookies()), PAGES, debug=True)
+    print("Session OK     :", session)
+    for i, r in enumerate(results, 1):
+        pg = r["page"]
+        print(f"\n[{i}] {pg['label']}  ->  {pg['url']}")
+        if r["error"]:
+            print("  error:", r["error"])
+            continue
+        posts, stories, blobs = extract_posts(r["content"])
+        print(f"  JSON blobs: {blobs} | Story nodes: {stories} | Posts: {len(posts)}")
+        for p in posts[:MAX_POSTS]:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(p["ts"]))
+            print(f"  - {when} | {p['id']} | {p['text'][:60]!r} | imgs={len(p['images'])}")
+    print("\nSaved debug_N.png and debug_N.html")
 
 
 def loop(test):
@@ -568,18 +709,39 @@ def main():
 
     if a.gate:
         return gate()
-    if not PAGE_ID or not get_raw_cookies():
-        sys.exit("Need FB_PAGE_ID and FB_COOKIES (or a cookies.txt file).")
-    if a.debug:
-        return run_debug()
-    if not TOKEN or not CHAT_ID:
-        sys.exit("Need TG_TOKEN and TG_CHAT_ID.")
-    test = a.test or env("TEST") == "1"
-    if a.cron:
-        return run_cron(test)
-    if a.once:
-        return run_once(test)
-    loop(test)
+
+    missing = []
+    if not PAGES:
+        missing.append("FB_PAGES")
+    if not get_raw_cookies():
+        missing.append("FB_COOKIES")
+    if not a.debug:
+        if not TOKEN:
+            missing.append("TG_TOKEN")
+        if not CHAT_ID:
+            missing.append("TG_CHAT_ID")
+    if missing:
+        msg = "Missing settings: " + ", ".join(missing)
+        if TOKEN and (OWNER_ID or CHAT_ID):
+            alert_throttled("config", msg)
+        sys.exit(msg)
+    if not OWNER_ID:
+        print("WARNING: TG_OWNER_ID is not set - status messages are not delivered "
+              "and alerts go to the channel.")
+
+    try:
+        if a.debug:
+            return run_debug()
+        test = a.test or env("TEST") == "1"
+        if a.cron:
+            return run_cron(test)
+        if a.once:
+            return run_once(test)
+        loop(test)
+    except Exception as e:
+        alert_throttled("crash", f"Unexpected crash: {type(e).__name__}: "
+                                 f"{str(e)[:200]}", hours=1)
+        raise
 
 
 if __name__ == "__main__":
