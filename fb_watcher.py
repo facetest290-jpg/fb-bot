@@ -252,11 +252,13 @@ def send_post(post, page):
 
 
 def notify(msg):
-    """Status messages: private chat only (never the channel)."""
-    if OWNER_ID:
-        tg("sendMessage", chat_id=OWNER_ID, text=msg)
+    """Status messages: the owner's private chat if TG_OWNER_ID is set,
+    otherwise the main chat/group (TG_CHAT_ID)."""
+    target = OWNER_ID or CHAT_ID
+    if target:
+        tg("sendMessage", chat_id=target, text=msg)
     else:
-        print("[TG_OWNER_ID not set]", msg.replace("\n", " | "))
+        print("[no TG_OWNER_ID / TG_CHAT_ID]", msg.replace("\n", " | "))
 
 
 def alert(msg):
@@ -737,8 +739,8 @@ def main():
             alert_throttled("config", msg)
         sys.exit(msg)
     if not OWNER_ID:
-        print("WARNING: TG_OWNER_ID is not set - status messages are not delivered "
-              "and alerts go to the channel.")
+        print("WARNING: TG_OWNER_ID is not set - reports and alerts will be "
+              "sent to TG_CHAT_ID (the group) instead.")
 
     try:
         if a.debug:
