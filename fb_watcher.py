@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Facebook pages -> Telegram watcher (Playwright + cookies), multi-page.
-Optimized for Railway Cron (one short run, then exit).
+Optimized for Railway Cron (one short run then exit).
 
 Env vars:
     TG_TOKEN, TG_CHAT_ID, FB_COOKIES (or cookies.txt)
