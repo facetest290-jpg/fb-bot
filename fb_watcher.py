@@ -24,6 +24,7 @@ Modes:
     --gate    decide if a check is due (no browser) -> GITHUB_OUTPUT
     --once    run one check now (ignores the schedule)
     --test    with --once/--cron: send the latest post of the first page
+              (env TEST=all: the latest post of every page)
     --debug   diagnose only: no Telegram, saves debug_N.png / debug_N.html
     (none)    loop forever
 """
@@ -94,6 +95,7 @@ CHECK_GAP = 20 * 60                     # gap between runs (seconds)
 GATE_TOLERANCE = 10 * 60
 MAX_POSTS = 10                          # newest posts read per page
 MAX_FAILS = 3                           # consecutive failures before stopping/alerting
+TEST_ALL = env("TEST").lower() == "all"  # TEST=all -> test post from EVERY page
 SEEN_KEEP = 200                         # remembered post ids per page
 try:
     RUN_BUDGET = int(env("RUN_BUDGET", "300"))
@@ -115,10 +117,10 @@ def parse_pages():
     raw = env("FB_PAGES") or env("FB_PAGE_ID") or LOCAL_PAGES
     pages, keys = [], set()
     for item in re.split(r"[\n,;]+", raw):
-        item = item.strip()
+        item = item.strip().strip("\"'").strip()  # tolerate pasted quotes
         if not item:
             continue
-        parts = [x.strip() for x in item.split("|")]
+        parts = [x.strip().strip("\"'").strip() for x in item.split("|")]
         spec = parts[0]
         if not spec or spec in keys:
             continue
@@ -126,6 +128,7 @@ def parse_pages():
         short = re.sub(r"^https?://(www\.|m\.)?facebook\.com/", "", spec).strip("/")
         pages.append({
             "key": spec,
+            "id": short,   # shown in the private (owner) messages
             "url": page_url(spec),
             "chat": (parts[1] if len(parts) > 1 and parts[1] else CHAT_ID),
             "label": (parts[2] if len(parts) > 2 and parts[2] else short),
@@ -557,9 +560,10 @@ def _run(test, t0):
                          "confirmation (checkpoint).", t0)
 
     ok_pages, test_done = 0, False
-    lines, new_total = [], 0
+    lines, new_total, important = [], 0, False
     for r in results:
         pg = r["page"]
+        pid = pg["id"]  # owner messages show the page ID (posts in the chat show the label)
         ps = pstate.setdefault(pg["key"], {})
         ps["last_check"] = int(time.time())
 
@@ -571,10 +575,11 @@ def _run(test, t0):
                 reason = "no posts could be read from the page"
         if reason:
             ps["fails"] = ps.get("fails", 0) + 1
-            print(f"[{pg['label']}] failure #{ps['fails']}: {reason}")
-            lines.append(f"- ⚠️ {pg['label']}: FAILED {ps['fails']}/{MAX_FAILS} ({reason})")
+            print(f"[{pid}] failure #{ps['fails']}: {reason}")
+            lines.append(f"⚠️ {pid}: FAILED {ps['fails']}/{MAX_FAILS} ({reason})")
+            important = True
             if ps["fails"] == MAX_FAILS:
-                alert(f"Page '{pg['label']}' failed {MAX_FAILS} times in a row.\n"
+                alert(f"Page {pid} failed {MAX_FAILS} times in a row.\n"
                       f"{pg['url']}\nLast reason: {reason}\n"
                       "The bot keeps trying it on every run.")
             continue
@@ -582,21 +587,25 @@ def _run(test, t0):
         ok_pages += 1
         ps["fails"] = 0
         seen = ps.get("seen")
-        if seen is None:  # first time we see this page: remember, send nothing
+        activated = seen is None
+        if activated:  # first time we see this page: remember, send nothing
             seen = ps["seen"] = [p["id"] for p in reversed(posts)]
-            notify(f"🟢 Page activated: {pg['label']}\n{pg['url']}\n"
-                   f"Saved {len(posts)} current posts without sending them.\n"
-                   f"Only new posts will be sent to {pg['chat']} from now on.")
-            if not (test and not test_done):
-                continue
-        if test and not test_done:
+            lines.append(f"🟢 {pid}: activated, {len(posts)} current post(s) saved "
+                         f"(not sent), new ones go to {pg['chat']}")
+            important = True
+        do_test = test and (TEST_ALL or not test_done)
+        if do_test:
             test_done = True
-            notify(f"Test: sending the latest post of {pg['label']}...")
+            important = True
             if send_post(posts[0], pg):
                 if posts[0]["id"] not in seen:
                     seen.append(posts[0]["id"])
+                lines.append(f"🧪 {pid}: test post sent")
             else:
-                notify("The test post could not be sent.")
+                lines.append(f"⚠️ {pid}: test post could not be sent "
+                             f"(Telegram: {LAST_TG_ERROR or 'unknown error'})")
+        if activated:
+            continue  # nothing else to send on the activation run
 
         seen_set = set(seen)
         new = [p for p in posts if p["id"] not in seen_set]
@@ -608,10 +617,12 @@ def _run(test, t0):
                 time.sleep(random.uniform(1, 3))
         ps["seen"] = seen
         new_total += len(new)
-        line = f"- {pg['label']}: {len(posts)} read, {len(new)} new, {sent} sent"
+        if new:
+            important = True
+        line = f"{pid}: {len(posts)} read, {len(new)} new, {sent} sent"
         if sent < len(new):
-            line += (f" ({len(new) - sent} will retry next run; "
-                     f"Telegram: {LAST_TG_ERROR or 'unknown error'})")
+            line = "⚠️ " + line + (f" ({len(new) - sent} will retry next run; "
+                                   f"Telegram: {LAST_TG_ERROR or 'unknown error'})")
         lines.append(line)
 
     if results and ok_pages == 0:
@@ -626,10 +637,10 @@ def _run(test, t0):
     nd = datetime.fromtimestamp(st["next_due"], TZ)
     print(f"Run OK: {ok_pages}/{len(order)} page(s) read, {new_total} new post(s).")
 
-    has_failed = any("FAILED" in l for l in lines)
-    if new_total == 0 and not has_failed and env("REPORT_ALWAYS") != "1":
+    # ONE private message per run, covering all pages
+    if not important and env("REPORT_ALWAYS") != "1":
         return
-    notify(f"Run report ({now_local():%Y-%m-%d %H:%M} {TZ.key})\n"
+    notify(f"📋 Run report ({now_local():%Y-%m-%d %H:%M} {TZ.key})\n"
            + "\n".join(lines) + f"\nNext run: about {nd:%H:%M}")
 
 
@@ -732,7 +743,7 @@ def main():
     try:
         if a.debug:
             return run_debug()
-        test = a.test or env("TEST") == "1"
+        test = a.test or env("TEST").lower() in ("1", "all")
         if a.cron:
             return run_cron(test)
         if a.once:
