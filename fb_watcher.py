@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Facebook pages -> Telegram watcher (Playwright + cookies), multi-page.
-Optimized for Railway Cron (one short run then exit).
+Optimized for Railway Cron (one short run, then exit).
 
 Env vars:
     TG_TOKEN, TG_CHAT_ID, FB_COOKIES (or cookies.txt)
@@ -33,9 +33,12 @@ import faulthandler
 import hashlib
 import html
 import json
+import multiprocessing
 import os
+import queue
 import random
 import re
+import signal
 import sys
 import threading
 import time
@@ -109,10 +112,14 @@ try:
     RUN_BUDGET = int(env("RUN_BUDGET", "300"))
 except ValueError:
     RUN_BUDGET = 300
-try:  # hard limit: a run that is still alive after this is force-killed
-    HARD_TIMEOUT = int(env("HARD_TIMEOUT", str(RUN_BUDGET + 180)))
+try:  # browser silent for this long (no page finished) = hung -> kill + retry
+    IDLE_TIMEOUT = int(env("IDLE_TIMEOUT", "75"))
 except ValueError:
-    HARD_TIMEOUT = RUN_BUDGET + 180
+    IDLE_TIMEOUT = 75
+try:  # last-resort limit: a run still alive after this is force-killed
+    HARD_TIMEOUT = int(env("HARD_TIMEOUT", str(RUN_BUDGET + 2 * IDLE_TIMEOUT + 60)))
+except ValueError:
+    HARD_TIMEOUT = RUN_BUDGET + 2 * IDLE_TIMEOUT + 60
 
 
 # ================================================================ pages
@@ -460,13 +467,20 @@ def url_is_blocked(url):
     return any(x in low for x in LOGIN_MARKS)
 
 
-def fetch_pages(cookie_list, pages, debug=False):
+def fetch_pages(cookie_list, pages, debug=False, on_result=None, budget=None):
     """One browser, one session, all pages one after the other.
     Returns (results, cookies, session_ok). results = [{page, content, error}]."""
     from playwright.sync_api import sync_playwright  # lazy: gate needs no deps
 
+    budget = RUN_BUDGET if budget is None else budget
     results, cookies, session = [], [], True
     started = time.time()
+
+    def emit(res):
+        results.append(res)
+        if on_result:
+            on_result(res)
+
     time.sleep(random.uniform(1, 4))
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -497,8 +511,8 @@ def fetch_pages(cookie_list, pages, debug=False):
             tab = ctx.new_page()
             for i, pg in enumerate(pages):
                 if i:
-                    if time.time() - started > RUN_BUDGET:
-                        print(f"Run budget ({RUN_BUDGET}s) reached; "
+                    if time.time() - started > budget:
+                        print(f"Run budget ({budget}s) reached; "
                               f"skipping {len(pages) - i} page(s) until next run.")
                         break
                     time.sleep(random.uniform(3, 7))
@@ -516,16 +530,91 @@ def fetch_pages(cookie_list, pages, debug=False):
                         tab.screenshot(path=str(BASE / f"debug_{i + 1}.png"))
                         (BASE / f"debug_{i + 1}.html").write_text(
                             content, encoding="utf-8")
-                    results.append({"page": pg, "content": content, "error": None})
+                    emit({"page": pg, "content": content, "error": None})
                 except Exception as e:
-                    results.append({"page": pg, "content": None,
-                                    "error": f"{type(e).__name__}: {str(e)[:100]}"})
+                    emit({"page": pg, "content": None,
+                          "error": f"{type(e).__name__}: {str(e)[:100]}"})
             cookies = ctx.cookies("https://www.facebook.com")
         finally:
             browser.close()
     if "c_user" not in {c["name"] for c in cookies}:
         session = False
     return results, cookies, session
+
+
+def _fetch_worker(q, cookie_list, pages, budget):
+    """Child process: runs the browser and reports every finished page."""
+    try:
+        os.setsid()  # own process group, so the parent can kill Chromium too
+    except Exception:
+        pass
+    try:
+        _, cookies, session = fetch_pages(
+            cookie_list, pages, on_result=lambda r: q.put(("page", r)), budget=budget)
+        q.put(("done", cookies, session))
+    except Exception as e:
+        q.put(("error", f"{type(e).__name__}: {str(e)[:150]}"))
+
+
+def _kill_group(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.join(5)
+    except Exception:
+        pass
+
+
+def fetch_pages_safe(cookie_list, pages):
+    """Run the browser in a child process. If it stays silent for IDLE_TIMEOUT
+    seconds (hung Chromium) it is killed and the unfinished pages are retried
+    once. Returns (results, cookies, session_ok, hangs)."""
+    ctx = multiprocessing.get_context("fork")
+    started = time.time()
+    results, cookies, session, hangs, last_error = [], [], True, 0, None
+    remaining = list(pages)
+    for attempt in range(2):
+        if not remaining:
+            break
+        budget = max(30, RUN_BUDGET - (time.time() - started))
+        q = ctx.Queue()
+        proc = ctx.Process(target=_fetch_worker,
+                           args=(q, cookie_list, remaining, budget), daemon=True)
+        proc.start()
+        got, finished, hung = set(), False, False
+        while True:
+            try:
+                msg = q.get(timeout=IDLE_TIMEOUT)
+            except queue.Empty:
+                hung = True
+                break
+            if msg[0] == "page":
+                results.append(msg[1])
+                got.add(msg[1]["page"]["key"])
+            elif msg[0] == "done":
+                cookies, session, finished = msg[1], msg[2], True
+                break
+            else:  # "error"
+                last_error = msg[1]
+                break
+        _kill_group(proc)  # also removes any Chromium left behind
+        if hung:
+            hangs += 1
+            print(f"Browser silent for {IDLE_TIMEOUT}s (attempt {attempt + 1}); "
+                  "killed it" + (" and retrying the unfinished pages." if attempt == 0 else "."))
+            remaining = [pg for pg in remaining if pg["key"] not in got]
+            if len(remaining) > 1:  # the page that hung goes last on the retry
+                remaining = remaining[1:] + remaining[:1]
+            continue
+        break  # finished or errored: no retry
+    if last_error and not results:
+        raise RuntimeError(last_error)
+    return results, cookies, session, hangs
 
 
 # ================================================================ runs
@@ -570,7 +659,15 @@ def _run(test, t0):
     order = sorted(PAGES, key=lambda p: pstate.get(p["key"], {}).get("last_check", 0))
 
     cookie_list = st.get("cookies") or parse_cookies(get_raw_cookies())
-    results, cookies, session = fetch_pages(cookie_list, order)
+    results, cookies, session, hangs = fetch_pages_safe(cookie_list, order)
+
+    if hangs and not results:  # browser hung on every attempt, nothing was read
+        alert_throttled("hang", "⏱ The browser hung on every attempt in this run and "
+                                "was killed. Nothing was read; the next run retries.",
+                        hours=1)
+        st["next_due"] = plan_next(t0)
+        save_state(st)
+        return
 
     if not session:
         return block(st, "Cookies expired or Facebook asked for login / identity "
@@ -646,13 +743,18 @@ def _run(test, t0):
         return register_failure(
             st, "Session is valid but no page could be read.", t0)
 
-    st["cookies"] = normalize_cookies(cookies)  # keep the session fresh
+    if cookies:  # empty if the browser was killed before it could report them
+        st["cookies"] = normalize_cookies(cookies)  # keep the session fresh
     st["fails"] = 0
     st["next_due"] = plan_next(t0)
     st["last_ok"] = int(time.time())
     save_state(st)
     nd = datetime.fromtimestamp(st["next_due"], TZ)
     print(f"Run OK: {ok_pages}/{len(order)} page(s) read, {new_total} new post(s).")
+
+    if hangs:
+        lines.append(f"⏱ browser hung {hangs} time(s) and was restarted")
+        important = True
 
     # ONE private message per run, covering all pages
     if not important and env("REPORT_ALWAYS") != "1":
