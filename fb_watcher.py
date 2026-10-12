@@ -14,6 +14,8 @@ Env vars:
                          somepage|@my_channel|Some Page
     FB_PAGE_ID  old single-page variable, still works if FB_PAGES is empty
     TG_OWNER_ID (optional), FB_USER_AGENT (optional), BOT_TZ (default Africa/Cairo)
+    TG_ADMIN_IDS  (optional) extra Telegram user ids allowed to send commands
+                  (the owner is always allowed; commands are off if both are empty)
     STATE_DIR   folder for state.json - point it to the Railway Volume (e.g. /data)
     QUIET_HOURS=off   disable the 22:00-08:00 quiet window (testing)
     RUN_BUDGET        max seconds per run before skipping remaining pages (default 300)
@@ -94,6 +96,7 @@ def env(name, default=""):
 TOKEN = env("TG_TOKEN", LOCAL_TOKEN)
 CHAT_ID = env("TG_CHAT_ID", LOCAL_CHAT_ID)
 OWNER_ID = env("TG_OWNER_ID")
+ADMINS = {x for x in re.split(r"[,\s;]+", f"{env('TG_OWNER_ID')},{env('TG_ADMIN_IDS')}") if x}
 TZ = ZoneInfo(env("BOT_TZ", "Africa/Cairo"))
 USER_AGENT = env(
     "FB_USER_AGENT",
@@ -102,7 +105,7 @@ USER_AGENT = env(
 )
 
 QUIET_START, QUIET_END = 22, 8          # no requests from 22:00 to 08:00
-CHECK_GAP = 60 * 60                     # gap between runs (seconds)
+CHECK_GAP = 20 * 60                     # gap between runs (seconds)
 GATE_TOLERANCE = 10 * 60
 MAX_POSTS = 10                          # newest posts read per page
 MAX_FAILS = 3                           # consecutive failures before stopping/alerting
@@ -303,6 +306,41 @@ def alert_throttled(key, msg, hours=6):
     alert(msg)
 
 
+def tg_json(method, **payload):
+    """Like tg() but returns the parsed JSON answer (or None)."""
+    global LAST_TG_ERROR
+    data = urllib.parse.urlencode(payload).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TOKEN}/{method}", data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        LAST_TG_ERROR = f"HTTP {e.code}"
+        print("Telegram error:", LAST_TG_ERROR, "(" + method + ")")
+        return None
+    except Exception as e:
+        LAST_TG_ERROR = type(e).__name__
+        print("Telegram error:", LAST_TG_ERROR, "(" + method + ")")
+        return None
+
+
+def send_report(st, text):
+    """Run reports go where the /reports_* commands say:
+    default = owner chat (or the main chat if no owner), 'chat' = the chat that sent
+    /reports_on, 'off' = never the group (owner chat only)."""
+    mode = st.get("report_mode")
+    if mode == "chat" and st.get("report_chat"):
+        extra = ({"message_thread_id": st["report_thread"]}
+                 if st.get("report_thread") else {})
+        tg("sendMessage", chat_id=st["report_chat"], text=text, **extra)
+    elif mode == "off":
+        if OWNER_ID:
+            tg("sendMessage", chat_id=OWNER_ID, text=text)
+    else:
+        notify(text)
+
+
 # ================================================================ state
 def load_state():
     if STATE_FILE.exists():
@@ -355,6 +393,8 @@ def plan_next(since=None):
 
 
 def should_run(st, tolerance=0, ignore_due=False):
+    if st.get("paused"):
+        return False, "paused (/resume to continue)"
     if env("FORCE") == "1":
         return True, "force"
     if st.get("blocked"):
@@ -748,7 +788,6 @@ def _run(test, t0):
     st["fails"] = 0
     st["next_due"] = plan_next(t0)
     st["last_ok"] = int(time.time())
-    save_state(st)
     nd = datetime.fromtimestamp(st["next_due"], TZ)
     print(f"Run OK: {ok_pages}/{len(order)} page(s) read, {new_total} new post(s).")
 
@@ -756,12 +795,14 @@ def _run(test, t0):
         lines.append(f"⏱ browser hung {hangs} time(s) and was restarted")
         important = True
 
-    # ONE private message per run, covering all pages
-    if not important and env("REPORT_ALWAYS") != "1":
-        return
-    notify(f"📋 Run report ({now_local():%Y-%m-%d %H:%M} {TZ.key})\n"
-           + "\n".join(lines) + f"\nNext run: about {nd:%H:%M}")
+    report = (f"📋 Run report ({now_local():%Y-%m-%d %H:%M} {TZ.key})\n"
+              + "\n".join(lines) + f"\nNext run: about {nd:%H:%M}")
+    st["last_report"] = {"text": report, "ts": int(time.time())}  # for /last
+    save_state(st)
 
+    # ONE message per run, covering all pages (only when something happened)
+    if important or env("REPORT_ALWAYS") == "1":
+        send_report(st, report)
 
 RUN_FLAG = _state_dir / "running.flag"
 
@@ -811,8 +852,165 @@ def run_once(test=False):
             pass
 
 
+# ================================================================ commands
+HELP_TEXT = (
+    "🤖 Commands\n"
+    "/status - bot state\n"
+    "/last - the last run report\n"
+    "/reports_on - send reports to THIS chat\n"
+    "/reports_off - stop sending reports to the group (owner chat only)\n"
+    "/pages - watched pages\n"
+    "/pause - stop checking Facebook\n"
+    "/resume - continue checking\n"
+    "/help - this list\n\n"
+    "Commands are read at the start of each run (every ~20 min), "
+    "so the answer is not instant.")
+
+
+def ago(ts):
+    if not ts:
+        return "never"
+    d = int(time.time() - ts)
+    if d < 90:
+        return f"{d}s ago"
+    if d < 5400:
+        return f"{d // 60} min ago"
+    if d < 172800:
+        return f"{d // 3600} h ago"
+    return f"{d // 86400} d ago"
+
+
+def _reply(msg, text):
+    extra = {}
+    if msg.get("is_topic_message") and msg.get("message_thread_id"):
+        extra["message_thread_id"] = msg["message_thread_id"]
+    tg("sendMessage", chat_id=msg["chat"]["id"], text=text, **extra)
+
+
+def _is_me(st, name):
+    """Is '/cmd@name' addressed to this bot? (several bots can share a group)"""
+    if not st.get("bot_username"):
+        r = tg_json("getMe")
+        if r and r.get("ok"):
+            st["bot_username"] = (r["result"].get("username") or "").lower()
+    return not st.get("bot_username") or name.lower() == st["bot_username"]
+
+
+def _status_text(st):
+    if st.get("blocked"):
+        state = f"⛔ blocked ({st.get('block_reason', 'unknown reason')[:80]})"
+    elif st.get("paused"):
+        state = "⏸ paused"
+    else:
+        state = "▶️ running"
+    mode = st.get("report_mode")
+    if mode == "chat":
+        rep_txt = "to the chat that sent /reports_on"
+    elif mode == "off":
+        rep_txt = "owner chat only (group muted)" if OWNER_ID else "off (no owner set)"
+    else:
+        rep_txt = "owner chat" if OWNER_ID else "main chat (no owner set)"
+    quiet = ("off" if env("QUIET_HOURS").lower() in ("off", "0", "false", "no")
+             else f"{QUIET_START}:00-{QUIET_END}:00")
+    failing = [pg["id"] for pg in PAGES
+               if st.get("pages", {}).get(pg["key"], {}).get("fails", 0)]
+    return (f"📊 Status\n{state}\n"
+            f"Last OK run: {ago(st.get('last_ok'))}\n"
+            f"Pages: {len(PAGES)}" + (f" (failing: {', '.join(failing)})" if failing else "") + "\n"
+            f"Reports: {rep_txt}\n"
+            f"Quiet hours: {quiet}")
+
+
+def process_command(st, msg):
+    """Returns 1 if the message was a command from an allowed user."""
+    text = (msg.get("text") or "").strip()
+    if not text.startswith("/"):
+        return 0
+    if str((msg.get("from") or {}).get("id", "")) not in ADMINS:
+        return 0  # silently ignore everybody else
+    cmd, _, target = text.split()[0][1:].partition("@")
+    if target and not _is_me(st, target):
+        return 0
+    cmd = cmd.lower()
+    chat = msg["chat"]["id"]
+
+    if cmd in ("help", "start"):
+        _reply(msg, HELP_TEXT)
+    elif cmd == "status":
+        _reply(msg, _status_text(st))
+    elif cmd in ("last", "report"):
+        lr = st.get("last_report")
+        _reply(msg, f"{lr['text']}\n\n🕒 {ago(lr['ts'])}" if lr
+               else "No report yet - it is created at the end of the next run.")
+    elif cmd == "pages":
+        rows = []
+        for pg in PAGES:
+            ps = st.get("pages", {}).get(pg["key"], {})
+            rows.append(f"{pg['id']} ({pg['label']}): fails {ps.get('fails', 0)}, "
+                        f"checked {ago(ps.get('last_check'))}, to {pg['chat']}")
+        _reply(msg, "📄 Pages\n" + "\n".join(rows))
+    elif cmd == "reports_on":
+        st["report_mode"] = "chat"
+        st["report_chat"] = chat
+        st["report_thread"] = (msg.get("message_thread_id")
+                               if msg.get("is_topic_message") else None)
+        _reply(msg, "✅ Reports will be sent to this chat. "
+                    "(🚨 alerts keep going to the owner chat.)")
+    elif cmd == "reports_off":
+        st["report_mode"] = "off"
+        _reply(msg, "🔕 Reports are no longer sent to the group."
+                    + (" They go to the owner chat." if OWNER_ID
+                       else " No owner is set, so nobody receives them."))
+    elif cmd == "pause":
+        st["paused"] = True
+        _reply(msg, "⏸ Paused. No Facebook requests until /resume. "
+                    "Commands still work.")
+    elif cmd == "resume":
+        st["paused"] = False
+        _reply(msg, "▶️ Resumed. The next scheduled run will check the pages.")
+    else:
+        return 0
+    return 1
+
+
+def handle_commands():
+    """Read pending Telegram commands (cheap: one getUpdates call, no browser)."""
+    if not TOKEN or not ADMINS:
+        return
+    st = load_state()
+    offset, changed = st.get("tg_offset"), False
+    for _ in range(10):  # a busy group can have several pages of updates
+        payload = {"timeout": 0, "limit": 100,
+                   "allowed_updates": json.dumps(["message"])}
+        if offset is not None:
+            payload["offset"] = offset
+        resp = tg_json("getUpdates", **payload)
+        if not resp or not resp.get("ok"):
+            break
+        updates = resp.get("result", [])
+        if not updates:
+            break
+        for u in updates:
+            offset, changed = u["update_id"] + 1, True
+            msg = u.get("message")
+            if msg:
+                try:
+                    process_command(st, msg)
+                except Exception as e:
+                    print("command error:", type(e).__name__, str(e)[:100])
+        if len(updates) < 100:
+            break
+    if changed:
+        st["tg_offset"] = offset
+        save_state(st)
+
+
 def run_cron(test=False):
     """Railway Cron entry: one run, then the process exits (stops billing)."""
+    try:
+        handle_commands()
+    except Exception as e:
+        print("handle_commands failed:", type(e).__name__, str(e)[:100])
     ok, why = should_run(load_state(), ignore_due=True)
     print(f"cron: run={ok} ({why}) local={now_local():%H:%M}")
     if ok:
@@ -840,6 +1038,10 @@ def run_debug():
 def loop(test):
     first = True
     while True:
+        try:
+            handle_commands()
+        except Exception as e:
+            print("handle_commands failed:", type(e).__name__, str(e)[:100])
         ok, why = should_run(load_state())
         if ok:
             run_once(test=test and first)
