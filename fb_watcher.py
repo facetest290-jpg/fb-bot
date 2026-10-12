@@ -13,6 +13,8 @@ Env vars:
               examples:  100064825534678
                          somepage|@my_channel|Some Page
     FB_PAGE_ID  old single-page variable, still works if FB_PAGES is empty
+    CHECK_EVERY_MIN  minutes between cron runs, only for display (default 20;
+                     set 60 if your Railway cron runs hourly)
     TG_OWNER_ID (optional), FB_USER_AGENT (optional), BOT_TZ (default Africa/Cairo)
     TG_ADMIN_IDS  (optional) extra Telegram user ids allowed to send commands
                   (the owner is always allowed; commands are off if both are empty)
@@ -105,7 +107,11 @@ USER_AGENT = env(
 )
 
 QUIET_START, QUIET_END = 22, 8          # no requests from 22:00 to 08:00
-CHECK_GAP = 60 * 60                     # gap between runs (seconds)
+try:  # how often the cron runs (only used for the "Next run" time and /help)
+    CHECK_EVERY_MIN = max(1, int(env("CHECK_EVERY_MIN", "20")))
+except ValueError:
+    CHECK_EVERY_MIN = 60
+CHECK_GAP = CHECK_EVERY_MIN * 60        # gap between runs (seconds)
 GATE_TOLERANCE = 10 * 60
 MAX_POSTS = 10                          # newest posts read per page
 MAX_FAILS = 3                           # consecutive failures before stopping/alerting
@@ -531,6 +537,13 @@ def fetch_pages(cookie_list, pages, debug=False, on_result=None, budget=None):
                   "--disable-dev-shm-usage",
                   "--disable-gpu",
                   "--disable-extensions",
+                  "--disable-background-networking",
+                  "--disable-component-update",
+                  "--disable-sync",
+                  "--mute-audio",
+                  "--no-first-run",
+                  "--renderer-process-limit=1",
+                  "--disable-features=IsolateOrigins,site-per-process,TranslateUI",
                   "--disable-blink-features=AutomationControlled"])
         try:
             ctx = browser.new_context(
@@ -548,7 +561,6 @@ def fetch_pages(cookie_list, pages, debug=False, on_result=None, budget=None):
                           if r.request.resource_type in BLOCKED_TYPES
                           else r.continue_())
             ctx.add_cookies(cookie_list)
-            tab = ctx.new_page()
             for i, pg in enumerate(pages):
                 if i:
                     if time.time() - started > budget:
@@ -556,24 +568,44 @@ def fetch_pages(cookie_list, pages, debug=False, on_result=None, budget=None):
                               f"skipping {len(pages) - i} page(s) until next run.")
                         break
                     time.sleep(random.uniform(3, 7))
-                try:
-                    tab.goto(pg["url"], wait_until="domcontentloaded", timeout=60000)
-                    tab.wait_for_timeout(random.randint(3000, 5000))
-                    if url_is_blocked(tab.url):
-                        session = False
+                res, blocked = None, False
+                for attempt in (1, 2):
+                    # a NEW tab per page, closed afterwards: frees the memory of
+                    # the previous page and a crashed tab cannot affect the next one
+                    tab = ctx.new_page()
+                    try:
+                        tab.goto(pg["url"], wait_until="domcontentloaded", timeout=60000)
+                        tab.wait_for_timeout(random.randint(3000, 5000))
+                        if url_is_blocked(tab.url):
+                            blocked = True
+                            break
+                        for _ in range(2):
+                            tab.mouse.wheel(0, random.randint(900, 1600))
+                            tab.wait_for_timeout(random.randint(1200, 2200))
+                        content = tab.content()
+                        if debug:
+                            tab.screenshot(path=str(BASE / f"debug_{i + 1}.png"))
+                            (BASE / f"debug_{i + 1}.html").write_text(
+                                content, encoding="utf-8")
+                        res = {"page": pg, "content": content, "error": None}
                         break
-                    for _ in range(2):
-                        tab.mouse.wheel(0, random.randint(900, 1600))
-                        tab.wait_for_timeout(random.randint(1200, 2200))
-                    content = tab.content()
-                    if debug:
-                        tab.screenshot(path=str(BASE / f"debug_{i + 1}.png"))
-                        (BASE / f"debug_{i + 1}.html").write_text(
-                            content, encoding="utf-8")
-                    emit({"page": pg, "content": content, "error": None})
-                except Exception as e:
-                    emit({"page": pg, "content": None,
-                          "error": f"{type(e).__name__}: {str(e)[:100]}"})
+                    except Exception as e:
+                        res = {"page": pg, "content": None,
+                               "error": f"{type(e).__name__}: {str(e)[:100]}"}
+                        crashed = any(w in str(e).lower() for w in ("crash", "closed"))
+                        if attempt == 1 and crashed:
+                            print(f"[{pg['id']}] tab crashed, retrying once in a new tab")
+                            continue
+                        break
+                    finally:
+                        try:
+                            tab.close()
+                        except Exception:
+                            pass
+                if blocked:
+                    session = False
+                    break
+                emit(res)
             cookies = ctx.cookies("https://www.facebook.com")
         finally:
             browser.close()
@@ -863,7 +895,7 @@ HELP_TEXT = (
     "/pause - stop checking Facebook\n"
     "/resume - continue checking\n"
     "/help - this list\n\n"
-    "Commands are read at the start of each run (every ~60 min), "
+    f"Commands are read at the start of each run (every ~{CHECK_EVERY_MIN} min), "
     "so the answer is not instant.")
 
 
