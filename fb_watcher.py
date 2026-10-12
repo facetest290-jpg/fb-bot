@@ -105,7 +105,7 @@ USER_AGENT = env(
 )
 
 QUIET_START, QUIET_END = 22, 8          # no requests from 22:00 to 08:00
-CHECK_GAP = 20 * 60                     # gap between runs (seconds)
+CHECK_GAP = 60 * 60                     # gap between runs (seconds)
 GATE_TOLERANCE = 10 * 60
 MAX_POSTS = 10                          # newest posts read per page
 MAX_FAILS = 3                           # consecutive failures before stopping/alerting
@@ -863,7 +863,7 @@ HELP_TEXT = (
     "/pause - stop checking Facebook\n"
     "/resume - continue checking\n"
     "/help - this list\n\n"
-    "Commands are read at the start of each run (every ~20 min), "
+    "Commands are read at the start of each run (every ~60 min), "
     "so the answer is not instant.")
 
 
