@@ -13,11 +13,14 @@ Env vars:
               examples:  100064825534678
                          somepage|@my_channel|Some Page
     FB_PAGE_ID  old single-page variable, still works if FB_PAGES is empty
+    SCROLLS          scroll steps per page (default 2; raise it if too few posts are read)
     CHECK_EVERY_MIN  minutes between cron runs, only for display (default 20;
                      set 60 if your Railway cron runs hourly)
     TG_OWNER_ID (optional), FB_USER_AGENT (optional), BOT_TZ (default Africa/Cairo)
     TG_ADMIN_IDS  (optional) extra Telegram user ids allowed to send commands
-                  (the owner is always allowed; commands are off if both are empty)
+                  (the owner is always allowed, in any chat)
+    GROUP_COMMANDS  on (default) = anyone in the destination group can send commands;
+                    off = only the owner / TG_ADMIN_IDS
     STATE_DIR   folder for state.json - point it to the Railway Volume (e.g. /data)
     QUIET_HOURS=off   disable the 22:00-08:00 quiet window (testing)
     RUN_BUDGET        max seconds per run before skipping remaining pages (default 300)
@@ -98,6 +101,9 @@ def env(name, default=""):
 TOKEN = env("TG_TOKEN", LOCAL_TOKEN)
 CHAT_ID = env("TG_CHAT_ID", LOCAL_CHAT_ID)
 OWNER_ID = env("TG_OWNER_ID")
+# GROUP_COMMANDS=off -> only the owner/admins can send commands (default: anyone
+# in the destination group can)
+GROUP_COMMANDS = env("GROUP_COMMANDS", "on").lower() not in ("off", "0", "false", "no")
 ADMINS = {x for x in re.split(r"[,\s;]+", f"{env('TG_OWNER_ID')},{env('TG_ADMIN_IDS')}") if x}
 TZ = ZoneInfo(env("BOT_TZ", "Africa/Cairo"))
 USER_AGENT = env(
@@ -108,9 +114,9 @@ USER_AGENT = env(
 
 QUIET_START, QUIET_END = 22, 8          # no requests from 22:00 to 08:00
 try:  # how often the cron runs (only used for the "Next run" time and /help)
-    CHECK_EVERY_MIN = max(1, int(env("CHECK_EVERY_MIN", "60")))
+    CHECK_EVERY_MIN = max(1, int(env("CHECK_EVERY_MIN", "20")))
 except ValueError:
-    CHECK_EVERY_MIN = 60
+    CHECK_EVERY_MIN = 20
 CHECK_GAP = CHECK_EVERY_MIN * 60        # gap between runs (seconds)
 GATE_TOLERANCE = 10 * 60
 MAX_POSTS = 10                          # newest posts read per page
@@ -121,6 +127,10 @@ try:
     RUN_BUDGET = int(env("RUN_BUDGET", "300"))
 except ValueError:
     RUN_BUDGET = 300
+try:  # scroll steps per page: more scrolling = more posts read, but slower
+    SCROLLS = max(1, int(env("SCROLLS", "2")))
+except ValueError:
+    SCROLLS = 2
 try:  # browser silent for this long (no page finished) = hung -> kill + retry
     IDLE_TIMEOUT = int(env("IDLE_TIMEOUT", "75"))
 except ValueError:
@@ -579,7 +589,7 @@ def fetch_pages(cookie_list, pages, debug=False, on_result=None, budget=None):
                         if url_is_blocked(tab.url):
                             blocked = True
                             break
-                        for _ in range(2):
+                        for _ in range(SCROLLS):
                             tab.mouse.wheel(0, random.randint(900, 1600))
                             tab.wait_for_timeout(random.randint(1200, 2200))
                         content = tab.content()
@@ -953,12 +963,23 @@ def _status_text(st):
             f"Quiet hours: {quiet}")
 
 
+def _in_allowed_group(chat):
+    """True if the message came from one of the groups the bot posts to."""
+    if not GROUP_COMMANDS or chat.get("type") not in ("group", "supergroup"):
+        return False
+    dests = {CHAT_ID.lower()} | {p["chat"].lower() for p in PAGES}
+    username = (chat.get("username") or "").lower()
+    return (str(chat.get("id")).lower() in dests
+            or (username and f"@{username}" in dests))
+
+
 def process_command(st, msg):
-    """Returns 1 if the message was a command from an allowed user."""
+    """Returns 1 if the message was a command from an allowed sender."""
     text = (msg.get("text") or "").strip()
     if not text.startswith("/"):
         return 0
-    if str((msg.get("from") or {}).get("id", "")) not in ADMINS:
+    sender = str((msg.get("from") or {}).get("id", ""))
+    if sender not in ADMINS and not _in_allowed_group(msg["chat"]):
         return 0  # silently ignore everybody else
     cmd, _, target = text.split()[0][1:].partition("@")
     if target and not _is_me(st, target):
@@ -1007,7 +1028,7 @@ def process_command(st, msg):
 
 def handle_commands():
     """Read pending Telegram commands (cheap: one getUpdates call, no browser)."""
-    if not TOKEN or not ADMINS:
+    if not TOKEN or not (ADMINS or GROUP_COMMANDS):
         return
     st = load_state()
     offset, changed = st.get("tg_offset"), False
