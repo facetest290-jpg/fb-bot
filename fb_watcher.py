@@ -108,7 +108,7 @@ USER_AGENT = env(
 
 QUIET_START, QUIET_END = 22, 8          # no requests from 22:00 to 08:00
 try:  # how often the cron runs (only used for the "Next run" time and /help)
-    CHECK_EVERY_MIN = max(1, int(env("CHECK_EVERY_MIN", "20")))
+    CHECK_EVERY_MIN = max(1, int(env("CHECK_EVERY_MIN", "60")))
 except ValueError:
     CHECK_EVERY_MIN = 60
 CHECK_GAP = CHECK_EVERY_MIN * 60        # gap between runs (seconds)
