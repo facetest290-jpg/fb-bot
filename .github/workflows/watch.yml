@@ -1,16 +1,31 @@
 # Put this file at:  .github/workflows/watch.yml   (on the default branch)
 # Run it from:       GitHub -> Actions -> "Watch Facebook page" -> Run workflow
 #
-# No inputs: everything comes from TWO repo Secrets
+# Config comes from TWO repo Secrets
 # (Settings -> Secrets and variables -> Actions -> New repository secret):
 #   ENV_FILE    = the full content of your .env file (including FB_PAGES)
 #   COOKIES_TXT = the full content of your cookies.txt file
 # They are written to .env and cookies.txt inside the runner only.
+#
+# The only choice when you press "Run workflow" is the mode:
+#   watch     = the real watch mode (WATCH_MODE=1 in ENV_FILE), the default
+#   test-now  = read the page NOW and send its newest post to Telegram
+#               (cookie check). Ignores WATCH_MODE and the schedule.
+#   debug     = read the page, print the result in the log, send nothing
 
 name: Watch Facebook page
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        type: choice
+        options:
+          - watch
+          - test-now
+          - debug
+        default: watch
 
 concurrency:
   group: watch-facebook
@@ -41,7 +56,13 @@ jobs:
           printf '%s\n' "$ENV_FILE" > .env
           printf '%s\n' "$COOKIES_TXT" > cookies.txt
 
-      - name: Run watch mode
+      - name: Run (${{ inputs.mode }})
         env:
+          MODE: ${{ inputs.mode }}
           STATE_DIR: ${{ runner.temp }}/state
-        run: python fb_watcher.py --cron
+        run: |
+          case "$MODE" in
+            test-now) python fb_watcher.py --once --test ;;
+            debug)    python fb_watcher.py --debug ;;
+            *)        python fb_watcher.py --cron ;;
+          esac
