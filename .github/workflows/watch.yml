@@ -1,43 +1,16 @@
 # Put this file at:  .github/workflows/watch.yml   (on the default branch)
 # Run it from:       GitHub -> Actions -> "Watch Facebook page" -> Run workflow
 #
-# Repo Secrets needed (Settings -> Secrets and variables -> Actions):
-#   TG_TOKEN, TG_CHAT_ID, FB_COOKIES, FB_PAGES      (required)
-#   TG_OWNER_ID                                     (optional, but recommended)
+# No inputs: everything comes from TWO repo Secrets
+# (Settings -> Secrets and variables -> Actions -> New repository secret):
+#   ENV_FILE    = the full content of your .env file (including FB_PAGES)
+#   COOKIES_TXT = the full content of your cookies.txt file
+# They are written to .env and cookies.txt inside the runner only.
 
 name: Watch Facebook page
 
 on:
   workflow_dispatch:
-    inputs:
-      watch_start:
-        description: "Start checking at (Cairo time, HH:MM:SS) e.g. 22:00:00"
-        required: true
-      fast_from:
-        description: "Fast checks from (HH:MM:SS) e.g. 21:59:40"
-        required: true
-      fast_to:
-        description: "Fast checks until (HH:MM:SS) e.g. 22:02:00"
-        required: true
-      watch_end:
-        description: "Hard stop at (HH:MM:SS) e.g. 22:30:00"
-        required: true
-      slow_sec:
-        description: "Seconds between normal checks"
-        default: "30"
-      fast_sec:
-        description: "Seconds between fast checks"
-        default: "10"
-      watch_date:
-        description: "Only run on this date (YYYY-MM-DD) - optional"
-        required: false
-      keyword:
-        description: "Stop only when a new post contains one of these (comma separated) - optional"
-        required: false
-      test:
-        description: "TEST: treat the newest existing post as new"
-        type: boolean
-        default: false
 
 concurrency:
   group: watch-facebook
@@ -60,25 +33,15 @@ jobs:
           pip install playwright
           playwright install --with-deps chromium
 
+      - name: Write .env and cookies.txt from secrets
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+          COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
+        run: |
+          printf '%s\n' "$ENV_FILE" > .env
+          printf '%s\n' "$COOKIES_TXT" > cookies.txt
+
       - name: Run watch mode
         env:
-          WATCH_MODE: "1"
-          BOT_TZ: "Africa/Cairo"
           STATE_DIR: ${{ runner.temp }}/state
-          # secrets
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          TG_OWNER_ID: ${{ secrets.TG_OWNER_ID }}
-          FB_COOKIES: ${{ secrets.FB_COOKIES }}
-          FB_PAGES: ${{ secrets.FB_PAGES }}
-          # inputs
-          WATCH_START: ${{ inputs.watch_start }}
-          WATCH_FAST_FROM: ${{ inputs.fast_from }}
-          WATCH_FAST_TO: ${{ inputs.fast_to }}
-          WATCH_END: ${{ inputs.watch_end }}
-          WATCH_SLOW_SEC: ${{ inputs.slow_sec }}
-          WATCH_FAST_SEC: ${{ inputs.fast_sec }}
-          WATCH_DATE: ${{ inputs.watch_date }}
-          WATCH_KEYWORD: ${{ inputs.keyword }}
-          WATCH_TEST: ${{ inputs.test && '1' || '' }}
         run: python fb_watcher.py --cron
