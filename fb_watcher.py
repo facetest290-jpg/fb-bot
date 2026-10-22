@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
 Facebook pages -> Telegram watcher (Playwright + cookies), multi-page.
-Optimized for Railway Cron (one short run, then exit).
+Built for Railway Cron (one short run, then exit) + a one-time WATCH mode.
 
-Env vars:
-    TG_TOKEN, TG_CHAT_ID, FB_COOKIES (or cookies.txt)
+=====================================================================
+ 1) REQUIRED
+=====================================================================
+    TG_TOKEN, TG_CHAT_ID, FB_COOKIES (or cookies.txt), FB_PAGES
+
+=====================================================================
+ 2) PAGES
+=====================================================================
     FB_PAGES  one or more pages, separated by new lines, commas or ';'
               each item:  page  or  page|chat_id  or  page|chat_id|label
               page    = numeric id, username, or full facebook URL
@@ -13,38 +19,69 @@ Env vars:
               examples:  100064825534678
                          somepage|@my_channel|Some Page
     FB_PAGE_ID  old single-page variable, still works if FB_PAGES is empty
-    SCROLLS          scroll steps per page (default 2; raise it if too few posts are read)
-    CHECK_EVERY_MIN  minutes between cron runs, only for display (default 20;
-                     set 60 if your Railway cron runs hourly)
-    TG_OWNER_ID (optional), FB_USER_AGENT (optional), BOT_TZ (default Africa/Cairo)
-    TG_ADMIN_IDS  (optional) extra Telegram user ids allowed to send commands
-                  (the owner is always allowed, in any chat)
-    GROUP_COMMANDS  on (default) = anyone in the destination group can send commands;
-                    off = only the owner / TG_ADMIN_IDS
-    STATE_DIR   folder for state.json - point it to the Railway Volume (e.g. /data)
-    QUIET_HOURS=off   disable the 22:00-08:00 quiet window (testing)
-    RUN_BUDGET        max seconds per run before skipping remaining pages (default 300)
-    REPORT_ALWAYS=1   owner report after every run (default: only when something happened)
 
-WATCH MODE (one-time event, first page of FB_PAGES only) - set WATCH_MODE=1:
-    Keeps a browser open and checks the page very often around a known release time,
-    sends the new post the moment it appears, then stops. Times are Cairo time (BOT_TZ).
+=====================================================================
+ 3) REPORTS  (status messages - NOT the posts themselves)
+=====================================================================
+    REPORTS=on|off   (default on)
+        off = the bot ONLY sends the posts. No run reports, no watch plan /
+              progress messages, no "run failed" warnings.
+              Critical 🚨 alerts (cookies expired, blocked, crash) still arrive,
+              and command replies (/status ...) still work.
+        on  = everything below is sent.
+    TG_OWNER_ID     owner's private chat: reports + alerts go here
+    TG_ADMIN_IDS    extra Telegram user ids allowed to send commands
+    GROUP_COMMANDS  on (default) = anyone in the destination group can send
+                    commands; off = only the owner / TG_ADMIN_IDS
+    REPORT_ALWAYS=1 cron mode: report after every run (default: only when
+                    something happened)
+    MSG_LANG        ar (default) / en - language of the WATCH-mode messages
+
+=====================================================================
+ 4) CRON MODE
+=====================================================================
+    SCROLLS          scroll steps per page (default 2)
+    CHECK_EVERY_MIN  minutes between cron runs, display only (default 20)
+    RUN_BUDGET       max seconds per run before skipping remaining pages (300)
+    IDLE_TIMEOUT     browser silent this long = hung -> kill + retry (75)
+    HARD_TIMEOUT     last-resort kill of a run that never ends
+    QUIET_HOURS=off  disable the 22:00-08:00 quiet window (testing)
+    STATE_DIR        folder for state.json - Railway Volume (e.g. /data)
+    TG_OWNER_ID (optional), FB_USER_AGENT (optional), BOT_TZ (Africa/Cairo)
+
+=====================================================================
+ 5) WATCH MODE (one-time event, FIRST page of FB_PAGES only)
+=====================================================================
+    WATCH_MODE=1   keeps ONE browser open and checks the page very often
+                   around a known release time, sends the new post the moment
+                   it appears, then stops. Times are Cairo time (BOT_TZ).
+
+    As soon as the process starts it sends a PLAN message: page id, start
+    time, minutes remaining, and every phase (normal / fast / normal / end).
+    Once started it does NOT exit until its mission is done:
+        - a (matching) new post was found and sent, or
+        - WATCH_END was reached, or
+        - the session was blocked (cookies expired).
+
     WATCH_START=09:57:00      first check
     WATCH_FAST_FROM=09:59:40  from here: fast checks
-    WATCH_FAST_TO=10:02:00    from here: slow checks again
+    WATCH_FAST_TO=10:02:00    from here: normal checks again
     WATCH_END=10:30:00        hard stop if nothing was found
     WATCH_SLOW_SEC=30  WATCH_FAST_SEC=10   seconds between checks
     WATCH_DATE=2026-10-20     (optional) only run on this day (YYYY-MM-DD)
-    WATCH_KEYWORD=form,تسجيل  (optional) stop only when a new post contains one of these
-    WATCH_LEAD_MIN=30         exit if the cron fires more than this many min before start
-    WATCH_WARMUP_SEC=60       open the browser this many seconds before WATCH_START
-    WATCH_FETCH_TIMEOUT=25    a check that takes longer = hung browser -> restart it
+    WATCH_KEYWORD=form,تسجيل  (optional) stop only when a new post contains one
+    WATCH_LEAD_MIN=0          0 = start waiting whenever the cron fires (default).
+                              N = exit if the cron fires more than N min early.
+    WATCH_WARMUP_SEC=60       open the browser this many seconds before the start
+    WATCH_FETCH_TIMEOUT=25    a check that takes longer = hung browser -> restart
     WATCH_TEST=1              test: treat the newest existing post as "new"
-    /pause and /resume work while it runs (commands are read every few seconds).
+    /pause /resume /watch work while it runs (read every few seconds).
 
-Modes:
+=====================================================================
+ 6) RUN MODES (command line)
+=====================================================================
     --cron    ONE run over all pages, then exit (Railway Cron)
-              (with WATCH_MODE=1 it runs the fast "watch" mode instead, see below)
+              (with WATCH_MODE=1 it runs the watch mode instead)
     --gate    decide if a check is due (no browser) -> GITHUB_OUTPUT
     --once    run one check now (ignores the schedule)
     --test    with --once/--cron: send the latest post of the first page
@@ -82,7 +119,9 @@ except Exception:
     pass
 
 
-# ================================================================ config
+# ################################################################
+# 1) CONFIG
+# ################################################################
 def load_env():
     p = BASE / ".env"
     if p.exists():
@@ -110,17 +149,25 @@ LOCAL_COOKIES = r"""
 """
 # --------------------------------------------------------------------
 
+OFF_VALUES = ("off", "0", "false", "no")
+
 
 def env(name, default=""):
     return (os.environ.get(name) or default).strip()
 
 
+def env_int(name, default, lo=None):
+    try:
+        v = int(env(name, str(default)))
+    except ValueError:
+        v = default
+    return max(lo, v) if lo is not None else v
+
+
 TOKEN = env("TG_TOKEN", LOCAL_TOKEN)
 CHAT_ID = env("TG_CHAT_ID", LOCAL_CHAT_ID)
 OWNER_ID = env("TG_OWNER_ID")
-# GROUP_COMMANDS=off -> only the owner/admins can send commands (default: anyone
-# in the destination group can)
-GROUP_COMMANDS = env("GROUP_COMMANDS", "on").lower() not in ("off", "0", "false", "no")
+GROUP_COMMANDS = env("GROUP_COMMANDS", "on").lower() not in OFF_VALUES
 ADMINS = {x for x in re.split(r"[,\s;]+", f"{env('TG_OWNER_ID')},{env('TG_ADMIN_IDS')}") if x}
 TZ = ZoneInfo(env("BOT_TZ", "Africa/Cairo"))
 USER_AGENT = env(
@@ -129,36 +176,37 @@ USER_AGENT = env(
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 )
 
-QUIET_START, QUIET_END = 22, 8          # no requests from 22:00 to 08:00
-try:  # how often the cron runs (only used for the "Next run" time and /help)
-    CHECK_EVERY_MIN = max(1, int(env("CHECK_EVERY_MIN", "20")))
-except ValueError:
-    CHECK_EVERY_MIN = 20
-CHECK_GAP = CHECK_EVERY_MIN * 60        # gap between runs (seconds)
+WATCH_MODE = env("WATCH_MODE") == "1"
+LANG = env("MSG_LANG", "ar").lower()           # language of the watch messages
+
+QUIET_START, QUIET_END = 22, 8                  # no requests from 22:00 to 08:00
+CHECK_EVERY_MIN = env_int("CHECK_EVERY_MIN", 20, lo=1)
+CHECK_GAP = CHECK_EVERY_MIN * 60                # gap between runs (seconds)
 GATE_TOLERANCE = 10 * 60
-MAX_POSTS = 10                          # newest posts read per page
-MAX_FAILS = 3                           # consecutive failures before stopping/alerting
-TEST_ALL = env("TEST").lower() == "all"  # TEST=all -> test post from EVERY page
-SEEN_KEEP = 200                         # remembered post ids per page
-try:
-    RUN_BUDGET = int(env("RUN_BUDGET", "300"))
-except ValueError:
-    RUN_BUDGET = 300
-try:  # scroll steps per page: more scrolling = more posts read, but slower
-    SCROLLS = max(1, int(env("SCROLLS", "2")))
-except ValueError:
-    SCROLLS = 2
-try:  # browser silent for this long (no page finished) = hung -> kill + retry
-    IDLE_TIMEOUT = int(env("IDLE_TIMEOUT", "75"))
-except ValueError:
-    IDLE_TIMEOUT = 75
-try:  # last-resort limit: a run still alive after this is force-killed
-    HARD_TIMEOUT = int(env("HARD_TIMEOUT", str(RUN_BUDGET + 2 * IDLE_TIMEOUT + 60)))
-except ValueError:
-    HARD_TIMEOUT = RUN_BUDGET + 2 * IDLE_TIMEOUT + 60
+MAX_POSTS = 10                                  # newest posts read per page
+MAX_FAILS = 3                                   # consecutive failures before stopping
+TEST_ALL = env("TEST").lower() == "all"         # TEST=all -> test post from EVERY page
+SEEN_KEEP = 200                                 # remembered post ids per page
+RUN_BUDGET = env_int("RUN_BUDGET", 300)
+SCROLLS = env_int("SCROLLS", 2, lo=1)
+IDLE_TIMEOUT = env_int("IDLE_TIMEOUT", 75)
+HARD_TIMEOUT = env_int("HARD_TIMEOUT", RUN_BUDGET + 2 * IDLE_TIMEOUT + 60)
+WATCH_SETTLE_MS = env_int("WATCH_SETTLE_MS", 400)
 
 
-# ================================================================ pages
+def reports_enabled():
+    """REPORTS=off -> the bot only sends posts (plus critical 🚨 alerts)."""
+    return env("REPORTS", "on").lower() not in OFF_VALUES
+
+
+def T(en, ar):
+    """Pick the text in the configured language (MSG_LANG)."""
+    return ar if LANG == "ar" else en
+
+
+# ################################################################
+# 2) PAGES
+# ################################################################
 def page_url(spec):
     if spec.lower().startswith("http"):
         return spec
@@ -194,6 +242,9 @@ def parse_pages():
 PAGES = parse_pages()
 
 
+# ################################################################
+# 3) COOKIES
+# ################################################################
 def get_raw_cookies():
     raw = os.environ.get("FB_COOKIES", "")
     if not raw.strip():
@@ -209,7 +260,6 @@ def cookie_hash():
     return hashlib.sha256(get_raw_cookies().encode()).hexdigest()[:16]
 
 
-# ================================================================ cookies
 def parse_cookies(raw):
     """Accepts Netscape format (cookies.txt) or a Cookie-Editor JSON export."""
     raw = raw.strip()
@@ -266,7 +316,9 @@ def normalize_cookies(cookies):
     return out
 
 
-# ================================================================ telegram
+# ################################################################
+# 4) TELEGRAM  (posts / reports / alerts)
+# ################################################################
 LAST_TG_ERROR = ""
 
 
@@ -292,6 +344,26 @@ def tg(method, **payload):
         return False
 
 
+def tg_json(method, http_timeout=30, **payload):
+    """Like tg() but returns the parsed JSON answer (or None)."""
+    global LAST_TG_ERROR
+    data = urllib.parse.urlencode(payload).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TOKEN}/{method}", data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=http_timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        LAST_TG_ERROR = f"HTTP {e.code}"
+        print("Telegram error:", LAST_TG_ERROR, "(" + method + ")")
+        return None
+    except Exception as e:
+        LAST_TG_ERROR = type(e).__name__
+        print("Telegram error:", LAST_TG_ERROR, "(" + method + ")")
+        return None
+
+
+# ---- posts: always sent, REPORTS never affects them ----
 def send_post(post, page):
     text = post["text"] or "(post without text)"
     if len(text) > 3000:
@@ -306,9 +378,12 @@ def send_post(post, page):
     return tg("sendMessage", chat_id=chat, text=caption)
 
 
+# ---- reports / status messages: silenced by REPORTS=off ----
 def notify(msg):
-    """Status messages: the owner's private chat if TG_OWNER_ID is set,
-    otherwise the main chat/group (TG_CHAT_ID)."""
+    """Status message to the owner's private chat (or the main chat)."""
+    if not reports_enabled():
+        print("[reports off]", msg.replace("\n", " | "))
+        return
     target = OWNER_ID or CHAT_ID
     if target:
         tg("sendMessage", chat_id=target, text=msg)
@@ -316,6 +391,26 @@ def notify(msg):
         print("[no TG_OWNER_ID / TG_CHAT_ID]", msg.replace("\n", " | "))
 
 
+def send_report(st, text):
+    """Reports go where the /reports_* commands say:
+    default = owner chat (or the main chat if no owner), 'chat' = the chat that
+    sent /reports_on, 'off' = never the group (owner chat only)."""
+    if not reports_enabled():
+        print("[reports off]", text.replace("\n", " | "))
+        return
+    mode = st.get("report_mode")
+    if mode == "chat" and st.get("report_chat"):
+        extra = ({"message_thread_id": st["report_thread"]}
+                 if st.get("report_thread") else {})
+        tg("sendMessage", chat_id=st["report_chat"], text=text, **extra)
+    elif mode == "off":
+        if OWNER_ID:
+            tg("sendMessage", chat_id=OWNER_ID, text=text)
+    else:
+        notify(text)
+
+
+# ---- alerts: critical, ALWAYS sent ----
 def alert(msg):
     tg("sendMessage", chat_id=OWNER_ID or CHAT_ID, text=f"🚨 ALERT: {msg}")
 
@@ -339,42 +434,9 @@ def alert_throttled(key, msg, hours=6):
     alert(msg)
 
 
-def tg_json(method, http_timeout=30, **payload):
-    """Like tg() but returns the parsed JSON answer (or None)."""
-    global LAST_TG_ERROR
-    data = urllib.parse.urlencode(payload).encode()
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{TOKEN}/{method}", data=data)
-    try:
-        with urllib.request.urlopen(req, timeout=http_timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        LAST_TG_ERROR = f"HTTP {e.code}"
-        print("Telegram error:", LAST_TG_ERROR, "(" + method + ")")
-        return None
-    except Exception as e:
-        LAST_TG_ERROR = type(e).__name__
-        print("Telegram error:", LAST_TG_ERROR, "(" + method + ")")
-        return None
-
-
-def send_report(st, text):
-    """Run reports go where the /reports_* commands say:
-    default = owner chat (or the main chat if no owner), 'chat' = the chat that sent
-    /reports_on, 'off' = never the group (owner chat only)."""
-    mode = st.get("report_mode")
-    if mode == "chat" and st.get("report_chat"):
-        extra = ({"message_thread_id": st["report_thread"]}
-                 if st.get("report_thread") else {})
-        tg("sendMessage", chat_id=st["report_chat"], text=text, **extra)
-    elif mode == "off":
-        if OWNER_ID:
-            tg("sendMessage", chat_id=OWNER_ID, text=text)
-    else:
-        notify(text)
-
-
-# ================================================================ state
+# ################################################################
+# 5) STATE
+# ################################################################
 def load_state():
     if STATE_FILE.exists():
         try:
@@ -399,14 +461,19 @@ def save_state(st):
     tmp.replace(STATE_FILE)  # atomic write
 
 
-# ================================================================ schedule
+# ################################################################
+# 6) SCHEDULE
+# ################################################################
 def now_local():
     return datetime.now(TZ)
 
 
+def quiet_disabled():
+    return env("QUIET_HOURS").lower() in OFF_VALUES
+
+
 def in_quiet(dt):
-    # QUIET_HOURS=off disables the quiet window (for testing at night)
-    if env("QUIET_HOURS").lower() in ("off", "0", "false", "no"):
+    if quiet_disabled():
         return False
     return dt.hour >= QUIET_START or dt.hour < QUIET_END
 
@@ -450,7 +517,9 @@ def gate():
             f.write(f"run={'true' if ok else 'false'}\n")
 
 
-# ================================================================ parsing
+# ################################################################
+# 7) PARSING  (Facebook JSON -> posts)
+# ################################################################
 def walk(o):
     stack = [o]
     while stack:
@@ -530,10 +599,11 @@ def extract_posts(page_html):
     return result, stories_seen, len(blobs)
 
 
-# ================================================================ browser
+# ################################################################
+# 8) BROWSER  (cron mode: one browser, all pages)
+# ################################################################
 BLOCKED_TYPES = {"image", "media", "font"}   # not needed: we parse the JSON
 LOGIN_MARKS = ("login", "checkpoint", "two_step", "recover", "disabled")
-
 
 CHROMIUM_ARGS = ["--no-sandbox",
                  "--disable-dev-shm-usage",
@@ -688,7 +758,7 @@ def fetch_pages_safe(cookie_list, pages):
         proc = ctx.Process(target=_fetch_worker,
                            args=(q, cookie_list, remaining, budget), daemon=True)
         proc.start()
-        got, finished, hung = set(), False, False
+        got, hung = set(), False
         while True:
             try:
                 msg = q.get(timeout=IDLE_TIMEOUT)
@@ -699,7 +769,7 @@ def fetch_pages_safe(cookie_list, pages):
                 results.append(msg[1])
                 got.add(msg[1]["page"]["key"])
             elif msg[0] == "done":
-                cookies, session, finished = msg[1], msg[2], True
+                cookies, session = msg[1], msg[2]
                 break
             else:  # "error"
                 last_error = msg[1]
@@ -719,7 +789,9 @@ def fetch_pages_safe(cookie_list, pages):
     return results, cookies, session, hangs
 
 
-# ================================================================ runs
+# ################################################################
+# 9) CRON RUN  (one run over all pages)
+# ################################################################
 def register_failure(st, reason, t0=None):
     st["fails"] = st.get("fails", 0) + 1
     print(f"Failure #{st['fails']}: {reason}")
@@ -746,15 +818,22 @@ def block(st, reason, t0=None):
           "Facebook until you update FB_COOKIES (or set RESET=1 once).")
 
 
-def _run(test, t0):
-    st = load_state()
-    st.pop("seen", None)  # legacy single-page key (now stored per page)
+def _reset_if_new_cookies(st):
+    """New FB_COOKIES (or RESET=1) = clear the 'blocked' flag and the fail counters."""
     if os.environ.get("RESET") == "1" or st.get("cookie_hash") != cookie_hash():
         st.update({"blocked": False, "fails": 0, "cookies": None,
                    "cookie_hash": cookie_hash()})
         st.pop("block_reason", None)
         for ps in st.get("pages", {}).values():
             ps["fails"] = 0
+        return True
+    return False
+
+
+def _run(test, t0):
+    st = load_state()
+    st.pop("seen", None)  # legacy single-page key (now stored per page)
+    _reset_if_new_cookies(st)
     pstate = st.setdefault("pages", {})
 
     # least recently checked first, so a time-limited run never starves a page
@@ -858,6 +937,7 @@ def _run(test, t0):
         important = True
 
     report = (f"📋 Run report ({now_local():%Y-%m-%d %H:%M} {TZ.key})\n"
+              f"📄 Pages checked: {', '.join(p['id'] for p in order)}\n"
               + "\n".join(lines) + f"\nNext run: about {nd:%H:%M}")
     st["last_report"] = {"text": report, "ts": int(time.time())}  # for /last
     save_state(st)
@@ -865,6 +945,7 @@ def _run(test, t0):
     # ONE message per run, covering all pages (only when something happened)
     if important or env("REPORT_ALWAYS") == "1":
         send_report(st, report)
+
 
 RUN_FLAG = _state_dir / "running.flag"
 
@@ -914,19 +995,22 @@ def run_once(test=False):
             pass
 
 
-# ================================================================ commands
+# ################################################################
+# 10) TELEGRAM COMMANDS
+# ################################################################
 HELP_TEXT = (
     "🤖 Commands\n"
     "/status - bot state\n"
     "/last - the last run report\n"
+    "/watch - watch mode plan (times, phases, page)\n"
     "/reports_on - send reports to THIS chat\n"
     "/reports_off - stop sending reports to the group (owner chat only)\n"
     "/pages - watched pages\n"
     "/pause - stop checking Facebook (also pauses watch mode)\n"
     "/resume - continue checking\n"
     "/help - this list\n\n"
-    f"Commands are read at the start of each run (every ~{CHECK_EVERY_MIN} min), "
-    "so the answer is not instant.")
+    f"In cron mode commands are read at the start of each run (every ~{CHECK_EVERY_MIN} "
+    "min), so the answer is not instant. In watch mode they are read every few seconds.")
 
 
 def ago(ts):
@@ -965,15 +1049,17 @@ def _status_text(st):
         state = "⏸ paused"
     else:
         state = "▶️ running"
-    mode = st.get("report_mode")
-    if mode == "chat":
-        rep_txt = "to the chat that sent /reports_on"
-    elif mode == "off":
-        rep_txt = "owner chat only (group muted)" if OWNER_ID else "off (no owner set)"
+    if not reports_enabled():
+        rep_txt = "OFF (REPORTS=off: posts only)"
     else:
-        rep_txt = "owner chat" if OWNER_ID else "main chat (no owner set)"
-    quiet = ("off" if env("QUIET_HOURS").lower() in ("off", "0", "false", "no")
-             else f"{QUIET_START}:00-{QUIET_END}:00")
+        mode = st.get("report_mode")
+        if mode == "chat":
+            rep_txt = "to the chat that sent /reports_on"
+        elif mode == "off":
+            rep_txt = "owner chat only (group muted)" if OWNER_ID else "off (no owner set)"
+        else:
+            rep_txt = "owner chat" if OWNER_ID else "main chat (no owner set)"
+    quiet = "off" if quiet_disabled() else f"{QUIET_START}:00-{QUIET_END}:00"
     failing = [pg["id"] for pg in PAGES
                if st.get("pages", {}).get(pg["key"], {}).get("fails", 0)]
     w = st.get("watch")
@@ -999,6 +1085,16 @@ def _in_allowed_group(chat):
             or (username and f"@{username}" in dests))
 
 
+def watch_info_text():
+    if not WATCH_MODE:
+        return T("Watch mode is OFF (set WATCH_MODE=1 to use it).",
+                 "وضع الواتش مقفول (فعّله بـ WATCH_MODE=1).")
+    try:
+        return watch_plan_text(watch_config(), PAGES[0])
+    except ValueError as e:
+        return T(f"Watch settings problem: {e}", f"في مشكلة في إعدادات الواتش: {e}")
+
+
 def process_command(st, msg):
     """Returns 1 if the message was a command from an allowed sender."""
     text = (msg.get("text") or "").strip()
@@ -1021,6 +1117,8 @@ def process_command(st, msg):
         lr = st.get("last_report")
         _reply(msg, f"{lr['text']}\n\n🕒 {ago(lr['ts'])}" if lr
                else "No report yet - it is created at the end of the next run.")
+    elif cmd == "watch":
+        _reply(msg, watch_info_text())
     elif cmd == "pages":
         rows = []
         for pg in PAGES:
@@ -1033,8 +1131,11 @@ def process_command(st, msg):
         st["report_chat"] = chat
         st["report_thread"] = (msg.get("message_thread_id")
                                if msg.get("is_topic_message") else None)
+        note = ("" if reports_enabled() else
+                "\n⚠️ But REPORTS=off is set in the variables, so nothing is sent "
+                "until you set REPORTS=on.")
         _reply(msg, "✅ Reports will be sent to this chat. "
-                    "(🚨 alerts keep going to the owner chat.)")
+                    "(🚨 alerts keep going to the owner chat.)" + note)
     elif cmd == "reports_off":
         st["report_mode"] = "off"
         _reply(msg, "🔕 Reports are no longer sent to the group."
@@ -1092,14 +1193,10 @@ def handle_commands(wait=0):
         save_state(st)
 
 
-# ================================================================ watch mode
-WATCH_MODE = env("WATCH_MODE") == "1"
-try:
-    WATCH_SETTLE_MS = int(env("WATCH_SETTLE_MS", "400"))
-except ValueError:
-    WATCH_SETTLE_MS = 400
-
-
+# ################################################################
+# 11) WATCH MODE
+# ################################################################
+# ---- 11a) browser child process --------------------------------
 def _watch_child(reqq, respq, cookie_list, url):
     """Child process: keeps ONE Chromium + ONE tab open and reloads the page
     every time the parent asks. If this process hangs the parent kills it."""
@@ -1217,6 +1314,7 @@ class WatchBrowser:
 make_watch_browser = WatchBrowser   # (tests replace this)
 
 
+# ---- 11b) settings + time helpers --------------------------------
 def _parse_hms(txt, name):
     try:
         parts = [int(x) for x in str(txt).strip().split(":")]
@@ -1256,7 +1354,7 @@ def watch_config():
         "start": start.timestamp(), "fast_from": fast_from.timestamp(),
         "fast_to": fast_to.timestamp(), "end": end.timestamp(),
         "slow_sec": num("WATCH_SLOW_SEC", 30), "fast_sec": num("WATCH_FAST_SEC", 10),
-        "lead": num("WATCH_LEAD_MIN", 30, 0) * 60,
+        "lead": num("WATCH_LEAD_MIN", 0, 0) * 60,        # 0 = no limit
         "warmup": num("WATCH_WARMUP_SEC", 60, 0),
         "fetch_timeout": num("WATCH_FETCH_TIMEOUT", 25, 5),
         "keywords": [k.strip().lower() for k in env("WATCH_KEYWORD").split(",") if k.strip()],
@@ -1273,16 +1371,96 @@ def _hms(ts):
     return datetime.fromtimestamp(ts, TZ).strftime("%H:%M:%S")
 
 
-def _watch_dead():
-    print("WATCHDOG: the watch run did not end on time - killing the process.")
-    try:
-        alert_throttled("watch_dead", "⏱ Watch mode did not stop on time and was "
-                                      "force-killed.", hours=1)
-    except Exception:
-        pass
-    os._exit(3)
+def _dur(sec):
+    """Seconds -> '44 دقيقة و 30 ثانية' / '44 min 30 s'."""
+    sec = max(0, int(round(sec)))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if LANG == "ar":
+        units, joiner = (("ساعة", h), ("دقيقة", m), ("ثانية", s)), " و "
+    else:
+        units, joiner = (("h", h), ("min", m), ("s", s)), " "
+    parts = [f"{v} {n}" for n, v in units if v]
+    return joiner.join(parts) if parts else T("0 s", "0 ثانية")
 
 
+# ---- 11c) the plan message ---------------------------------------
+def watch_plan_text(cfg, pg, now=None):
+    """The 'what will happen and when' message, sent the moment watch mode starts
+    (and by /watch). Works for any combination of times."""
+    now = time.time() if now is None else now
+    L = [T("🛰 WATCH MODE is ON", "🛰 وضع الواتش (Watch) شغّال"), ""]
+    L.append(T(f"📄 Page: {pg['id']} ({pg['label']})",
+               f"📄 الصفحة: {pg['id']} ({pg['label']})"))
+    L.append(f"🔗 {pg['url']}")
+    L.append(T(f"📨 New posts go to: {pg['chat']}",
+               f"📨 البوستات الجديدة هتتبعت على: {pg['chat']}"))
+    L.append(T(f"🕒 Now: {_hms(now)} ({TZ.key})",
+               f"🕒 الوقت دلوقتي: {_hms(now)} ({TZ.key})"))
+    L.append("")
+
+    # --- countdown
+    if now < cfg["start"]:
+        rem = cfg["start"] - now
+        extra = (T(f" (= {int(rem // 60)} min)", f" (= {int(rem // 60)} دقيقة)")
+                 if rem >= 3600 else "")
+        L.append(T(f"⏳ Checking starts at {_hms(cfg['start'])}",
+                   f"⏳ الفحص هيبدأ الساعة {_hms(cfg['start'])}"))
+        L.append(T(f"   Time left: {_dur(rem)}{extra}",
+                   f"   باقي: {_dur(rem)}{extra}"))
+        if cfg["warmup"]:
+            warm = cfg["start"] - cfg["warmup"]
+            L.append(T(f"🔧 The browser opens at {_hms(warm)} ({cfg['warmup']}s before) "
+                       "and saves the posts already on the page, so they are not re-sent.",
+                       f"🔧 المتصفح هيتفتح الساعة {_hms(warm)} (قبلها بـ {cfg['warmup']} ثانية) "
+                       "وهيحفظ البوستات الموجودة أصلًا عشان ميبعتهاش تاني."))
+    elif now < cfg["end"]:
+        L.append(T(f"▶️ The checking window already started ({_hms(cfg['start'])}), "
+                   "checking now.",
+                   f"▶️ وقت الفحص بدأ بالفعل ({_hms(cfg['start'])}) والبوت بيفحص دلوقتي."))
+    L.append("")
+
+    # --- phases
+    pts = sorted({cfg["start"], cfg["end"]} |
+                 {t for t in (cfg["fast_from"], cfg["fast_to"])
+                  if cfg["start"] < t < cfg["end"]})
+    L.append(T("📋 Plan, in order:", "📋 الخطة بالترتيب:"))
+    n = 0
+    for a, b in zip(pts, pts[1:]):
+        if b <= now:
+            continue
+        n += 1
+        phase, interval = watch_phase(cfg, a)
+        icon = "⚡" if phase == "fast" else "🔄"
+        name = (T("FAST checks", "فحص سريع (فاست)") if phase == "fast"
+                else T("Normal checks", "فحص عادي"))
+        live = T("  ← running now", "  ← شغّال دلوقتي") if a <= now < b else ""
+        L.append(f"{n}) {icon} {name}: {_hms(a)} → {_hms(b)} ({_dur(b - a)}) — "
+                 + T(f"every {interval}s", f"كل {interval} ثانية") + live)
+    L.append("")
+
+    # --- how it ends
+    L.append(T(f"🛑 Hard stop at {_hms(cfg['end'])} if nothing is found.",
+               f"🛑 النهاية الساعة {_hms(cfg['end'])} لو مفيش بوست جديد."))
+    if cfg["keywords"]:
+        kw = ", ".join(cfg["keywords"])
+        L.append(T(f"🎯 Stops when a new post containing: {kw}",
+                   f"🎯 بيقف أول ما ينزل بوست جديد فيه: {kw}"))
+    else:
+        L.append(T("🎯 Stops as soon as a new post is found and sent.",
+                   "🎯 بيقف أول ما يلاقي بوست جديد ويبعته."))
+    L.append(T("   It does not stop before that (or the hard stop).",
+               "   ومش هيقف قبل كده (أو قبل وقت النهاية)."))
+    if env("WATCH_TEST") == "1":
+        L.append(T("🧪 TEST: the newest existing post is treated as new.",
+                   "🧪 تجربة: أحدث بوست موجود هيتعامل كأنه جديد."))
+    L.append("")
+    L.append(T("Commands: /pause  /resume  /watch  /status",
+               "الأوامر: /pause  /resume  /watch  /status"))
+    return "\n".join(L)
+
+
+# ---- 11d) the watcher ---------------------------------------------
 def _poll(secs):
     """Wait up to `secs` seconds while listening to Telegram commands.
     Returns early when something arrives, so the caller can react (e.g. /pause)."""
@@ -1300,8 +1478,310 @@ def _poll(secs):
         time.sleep(min(secs, 25))
 
 
+class Watch:
+    """One-time event mode: fast checks of ONE page around a release time.
+    run() returns only when the mission is finished."""
+
+    def __init__(self, cfg, pg, cookie_list, test):
+        self.cfg, self.pg, self.cookie_list, self.test = cfg, pg, cookie_list, test
+        ps0 = load_state().get("pages", {}).get(pg["key"], {})
+        self.browser = None
+        self.baselined = ps0.get("seen") is not None
+        self.checks = self.restarts = self.consec_err = 0
+        self.last_warn = 0.0
+        self.phase = self.interval = None
+        self.paused = False
+        self.found = None
+        self.final = None            # found / ended / blocked
+        self.test_done = False
+        self.ready_sent = False
+        self.next_check = 0.0
+
+    # ---------- messages ----------
+    def announce(self, text):
+        """Progress messages (follow REPORTS and /reports_on /reports_off)."""
+        send_report(load_state(), text)
+
+    def warn(self, text):
+        """Problems: owner chat, at most one every 20 s."""
+        if time.time() - self.last_warn > 20:
+            self.last_warn = time.time()
+            notify(text)
+
+    def matches(self, post):
+        kws = self.cfg["keywords"]
+        if not kws:
+            return True
+        low = (post["text"] or "").lower()
+        return any(k in low for k in kws)
+
+    def summary(self):
+        return T(f"{self.checks} checks, {self.restarts} browser restart(s)",
+                 f"{self.checks} فحص، {self.restarts} إعادة تشغيل للمتصفح")
+
+    # ---------- reading the page ----------
+    def save_status(self, st, phase, interval):
+        st["watch"] = {"phase": phase, "interval": interval, "checks": self.checks,
+                       "restarts": self.restarts, "last_check": int(time.time()),
+                       "end": self.cfg["end"]}
+
+    def handle_posts(self, posts, active):
+        cfg, pg = self.cfg, self.pg
+        st = load_state()
+        ps = st.setdefault("pages", {}).setdefault(pg["key"], {})
+        seen = ps.get("seen")
+        if seen is None:  # first look at this page: remember what is already there
+            old = [p for p in reversed(posts) if p["ts"] < cfg["start"]]
+            seen = ps["seen"] = [p["id"] for p in old]
+            print(f"watch: baseline saved ({len(seen)} post(s))")
+        self.baselined = True
+        if not active:  # warm-up: only remember what is already on the page
+            save_state(st)
+            return "ok"
+        if self.test and not self.test_done:  # WATCH_TEST: newest post counts as new
+            self.test_done = True
+            if posts and posts[0]["id"] in seen:
+                seen.remove(posts[0]["id"])
+        seen_set = set(seen)
+        new = sorted([p for p in posts if p["id"] not in seen_set],
+                     key=lambda x: x["ts"])
+        sent = []
+        for p in new:
+            t_send = time.time()
+            if send_post(p, pg):
+                seen.append(p["id"])
+                sent.append((p, t_send))
+            else:
+                self.warn(T(
+                    "⚠️ A new post was found but could not be sent to Telegram "
+                    f"({LAST_TG_ERROR or 'unknown error'}). Retrying on the next check.",
+                    "⚠️ لقيت بوست جديد بس معرفتش أبعته على تيليجرام "
+                    f"({LAST_TG_ERROR or 'سبب غير معروف'}). هحاول تاني في الفحص الجاي."))
+        ps["seen"] = seen
+        ps["last_check"] = int(time.time())
+        phase, interval = watch_phase(cfg, time.time())
+        self.save_status(st, phase, interval)
+        save_state(st)
+        hit = [(p, t) for p, t in sent if self.matches(p)]
+        if hit:
+            p, t_send = hit[0]
+            delay = t_send - p["ts"]
+            if 0 <= delay < 3600:
+                when = T(f"published {_hms(p['ts'])}, sent {_hms(t_send)}, delay {int(delay)}s",
+                         f"اتنشر {_hms(p['ts'])}، اتبعت {_hms(t_send)}، التأخير {int(delay)} ثانية")
+            else:
+                when = T(f"sent {_hms(t_send)}", f"اتبعت {_hms(t_send)}")
+            self.found = T(f"🎯 New post detected and sent ({when}).",
+                           f"🎯 اتلقى بوست جديد واتبعت ({when}).")
+            return "found"
+        return "ok"
+
+    def do_check(self, active):
+        """One page load. Returns ok / found / blocked / retry / retry_soon."""
+        self.checks += 1
+        r = self.browser.fetch(self.cfg["fetch_timeout"])
+        kind = r[0] if r else "hang"
+        if kind == "page":
+            _, html_text, url = r
+            if url_is_blocked(url):
+                block(load_state(), "Cookies expired or Facebook asked for login / "
+                                    "identity confirmation (checkpoint) during watch "
+                                    "mode.", time.time())
+                return "blocked"
+            posts = extract_posts(html_text)[0][:MAX_POSTS]
+            if posts:
+                self.consec_err = 0
+                return self.handle_posts(posts, active)
+            reason = "no posts could be read from the page"
+        elif kind == "hang":
+            reason = f"the browser did not answer for {self.cfg['fetch_timeout']}s"
+        elif kind == "dead":
+            reason = "the browser process died"
+        else:  # err / fatal
+            reason = r[1] if len(r) > 1 else kind
+        self.consec_err += 1
+        hard = kind in ("hang", "dead", "fatal") or self.consec_err >= 3
+        if hard:
+            self.drop_browser()
+            self.restarts += 1
+            self.consec_err = 0
+            self.warn(T(f"⚠️ Watch: {reason}. Restarting the browser, checking continues.",
+                        f"⚠️ الواتش: {reason}. بعيد تشغيل المتصفح والفحص مكمّل."))
+            return "retry"
+        self.warn(T(f"⚠️ Watch: check failed ({reason}). Trying again in a moment.",
+                    f"⚠️ الواتش: الفحص فشل ({reason}). هحاول تاني حالًا."))
+        return "retry_soon"
+
+    # ---------- browser ----------
+    def start_browser(self):
+        b = make_watch_browser(self.cookie_list, self.pg["url"])
+        if b.wait_ready(60):
+            self.browser = b
+            if not self.ready_sent and time.time() < self.cfg["start"]:
+                self.ready_sent = True
+                rem = self.cfg["start"] - time.time()
+                self.announce(T(
+                    f"🔧 Browser is open and ready for page {self.pg['id']}. "
+                    f"Checking starts at {_hms(self.cfg['start'])} (in {_dur(rem)}).",
+                    f"🔧 المتصفح اتفتح وجاهز للصفحة {self.pg['id']}. "
+                    f"الفحص هيبدأ الساعة {_hms(self.cfg['start'])} (بعد {_dur(rem)})."))
+            return True
+        b.kill()
+        self.restarts += 1
+        self.warn(T("⚠️ Watch: the browser could not start. Trying again.",
+                    "⚠️ الواتش: المتصفح معرفش يشتغل. هحاول تاني."))
+        return False
+
+    def drop_browser(self):
+        b, self.browser = self.browser, None
+        if b:
+            b.kill()
+
+    def close_browser_save_cookies(self):
+        b, self.browser = self.browser, None
+        if not b:
+            return
+        ck = b.stop()
+        if ck:
+            st = load_state()
+            st["cookies"] = normalize_cookies(ck)
+            save_state(st)
+
+    # ---------- one step of the main loop ----------
+    def tick(self):
+        cfg, pg = self.cfg, self.pg
+        now = time.time()
+        if now >= cfg["end"]:
+            self.final = "ended"
+            return
+        phase, interval = watch_phase(cfg, now)
+
+        # --- paused by /pause: close the browser, keep listening
+        if load_state().get("paused"):
+            self.close_browser_save_cookies()
+            if not self.paused:
+                self.paused = True
+                self.announce(T(
+                    "⏸ Watch paused: no checks are made. Send /resume to continue.",
+                    "⏸ الواتش واقف مؤقتًا: مفيش فحص. ابعت /resume عشان يكمّل."))
+            return _poll(min(25, cfg["end"] - now))
+        if self.paused:
+            self.paused = False
+            self.next_check = 0.0
+            if now >= cfg["start"]:
+                self.phase = phase  # the message below already says the interval
+                self.announce(T(f"▶️ Watch resumed: checking every {interval}s.",
+                                f"▶️ الواتش كمّل: فحص كل {interval} ثانية."))
+            else:
+                self.announce(T(f"▶️ Watch resumed: checking starts at {_hms(cfg['start'])}.",
+                                f"▶️ الواتش كمّل: الفحص هيبدأ الساعة {_hms(cfg['start'])}."))
+
+        # --- waiting for the warm-up moment
+        warm_ts = cfg["start"] - cfg["warmup"]
+        if now < warm_ts:
+            return _poll(min(25, warm_ts - now))
+        if self.browser is None:
+            if not self.start_browser():
+                _poll(min(5, cfg["end"] - time.time()))
+            return  # re-evaluate the time after the (slow) start
+
+        # --- phase announcements
+        active = now >= cfg["start"]
+        if active and phase != self.phase:
+            if self.phase is None:
+                self.announce(T(
+                    f"🟢 Checking started: page {pg['id']} ({pg['label']}), every "
+                    f"{interval}s, until {_hms(cfg['end'])}. Send /pause to stop.",
+                    f"🟢 الفحص بدأ: الصفحة {pg['id']} ({pg['label']})، كل {interval} "
+                    f"ثانية، لحد {_hms(cfg['end'])}. ابعت /pause للإيقاف."))
+            elif phase == "fast":
+                self.announce(T(
+                    f"⚡ FAST mode on (page {pg['id']}): checking every {interval}s "
+                    f"until {_hms(cfg['fast_to'])}.",
+                    f"⚡ دخلنا وضع الفاست (الصفحة {pg['id']}): فحص كل {interval} ثانية "
+                    f"لحد {_hms(cfg['fast_to'])}."))
+            else:
+                self.announce(T(
+                    f"🔄 Back to normal checks (page {pg['id']}): every {interval}s "
+                    f"until {_hms(cfg['end'])}.",
+                    f"🔄 رجعنا للفحص العادي (الصفحة {pg['id']}): كل {interval} ثانية "
+                    f"لحد {_hms(cfg['end'])}."))
+            self.phase, self.interval = phase, interval
+            self.next_check = min(self.next_check, now)  # check right at the boundary
+
+        # --- check now?
+        due = now >= self.next_check and (active or not self.baselined)
+        if due:
+            t0 = time.time()
+            res = self.do_check(active)
+            if res in ("found", "blocked"):
+                self.final = res
+            elif res == "retry":
+                self.next_check = 0.0
+            elif res == "retry_soon":
+                self.next_check = time.time() + 2
+            elif active:
+                self.next_check = t0 + interval
+            return
+
+        # --- sleep until the next check or the next phase boundary
+        targets = [cfg["end"]]
+        if active or not self.baselined:
+            targets.append(self.next_check)
+        if not active:
+            targets.append(cfg["start"])
+        targets += [t for t in (cfg["fast_from"], cfg["fast_to"]) if t > now]
+        _poll(min(25, max(0.0, min(targets) - time.time())))
+
+    # ---------- main loop ----------
+    def run(self):
+        cfg = self.cfg
+        print(f"watch: page {self.pg['id']} | start {_hms(cfg['start'])} | fast "
+              f"{_hms(cfg['fast_from'])}-{_hms(cfg['fast_to'])} | end {_hms(cfg['end'])} | "
+              f"every {cfg['slow_sec']}s / {cfg['fast_sec']}s")
+        errors = 0
+        try:
+            while self.final is None:
+                try:
+                    self.tick()
+                    errors = 0
+                except Exception as e:  # nothing may stop the watch before its end
+                    errors += 1
+                    print("watch: unexpected error:", type(e).__name__, str(e)[:150])
+                    if errors in (1, 10):
+                        self.warn(T(f"⚠️ Watch: internal error ({type(e).__name__}). "
+                                    "Still running.",
+                                    f"⚠️ الواتش: حصل خطأ داخلي ({type(e).__name__}). "
+                                    "لسه شغّال."))
+                    self.drop_browser()
+                    time.sleep(min(2 * errors, 10))
+        finally:
+            self.close_browser_save_cookies()
+
+        if self.final == "found":
+            self.announce(T(f"{self.found}\n✅ Watch finished ({self.summary()}).",
+                            f"{self.found}\n✅ الواتش خلّص مهمته ({self.summary()})."))
+        elif self.final == "ended":
+            self.announce(T(
+                f"⏹ Watch window ended at {_hms(cfg['end'])} without a "
+                f"{'matching ' if cfg['keywords'] else ''}new post ({self.summary()}).",
+                f"⏹ وقت الواتش خلص الساعة {_hms(cfg['end'])} من غير ما ينزل بوست "
+                f"{'مطابق ' if cfg['keywords'] else ''}جديد ({self.summary()})."))
+        print(f"watch: finished ({self.final}); {self.summary()}")
+
+
+def _watch_dead():
+    print("WATCHDOG: the watch run did not end on time - killing the process.")
+    try:
+        alert_throttled("watch_dead", "⏱ Watch mode did not stop on time and was "
+                                      "force-killed.", hours=1)
+    except Exception:
+        pass
+    os._exit(3)
+
+
 def run_watch(test=False):
-    """One-time event mode: fast checks of ONE page around a release time."""
+    """Entry of watch mode: checks, plan message, then Watch.run()."""
     try:
         cfg = watch_config()
     except ValueError as e:
@@ -1319,16 +1799,13 @@ def run_watch(test=False):
     if now >= cfg["end"]:
         print(f"watch: the window already ended at {_hms(cfg['end'])} - nothing to do")
         return
-    if cfg["start"] - now > cfg["lead"]:
+    if cfg["lead"] and cfg["start"] - now > cfg["lead"]:
         print(f"watch: starts in {int((cfg['start'] - now) / 60)} min, more than "
               f"WATCH_LEAD_MIN ({cfg['lead'] // 60}) - exiting to save credit")
         return
 
     st = load_state()
-    if os.environ.get("RESET") == "1" or st.get("cookie_hash") != cookie_hash():
-        st.update({"blocked": False, "fails": 0, "cookies": None,
-                   "cookie_hash": cookie_hash()})
-        st.pop("block_reason", None)
+    if _reset_if_new_cookies(st):
         save_state(st)
     if st.get("blocked"):
         print("watch: blocked -", st.get("block_reason"))
@@ -1340,221 +1817,19 @@ def run_watch(test=False):
     watchdog = threading.Timer(max(60, cfg["end"] - now) + 300, _watch_dead)
     watchdog.daemon = True
     watchdog.start()
-
-    cookie_list = st.get("cookies") or parse_cookies(get_raw_cookies())
-    test = test or env("WATCH_TEST") == "1"
-    ps0 = st.get("pages", {}).get(pg["key"], {})
-    S = {"browser": None, "baselined": ps0.get("seen") is not None,
-         "checks": 0, "restarts": 0, "consec_err": 0, "last_warn": 0.0,
-         "phase": None, "interval": None, "paused": False, "found": None,
-         "test_done": False}
-
-    def announce(text):          # follows /reports_on and /reports_off
-        send_report(load_state(), text)
-
-    def warn(text):              # problems: owner chat (throttled)
-        if time.time() - S["last_warn"] > 20:
-            S["last_warn"] = time.time()
-            notify(text)
-
-    def matches(post):
-        if not cfg["keywords"]:
-            return True
-        low = (post["text"] or "").lower()
-        return any(k in low for k in cfg["keywords"])
-
-    def save_status(st2, phase, interval):
-        st2["watch"] = {"phase": phase, "interval": interval, "checks": S["checks"],
-                        "restarts": S["restarts"], "last_check": int(time.time()),
-                        "end": cfg["end"]}
-
-    def handle_posts(posts, active):
-        st2 = load_state()
-        ps = st2.setdefault("pages", {}).setdefault(pg["key"], {})
-        seen = ps.get("seen")
-        if seen is None:  # first look at this page: remember what is already there
-            old = [p for p in reversed(posts) if p["ts"] < cfg["start"]]
-            seen = ps["seen"] = [p["id"] for p in old]
-            print(f"watch: baseline saved ({len(seen)} post(s))")
-        S["baselined"] = True
-        if not active:  # warm-up: only remember what is already on the page
-            save_state(st2)
-            return "ok"
-        if test and not S["test_done"]:  # WATCH_TEST: pretend the newest post is new
-            S["test_done"] = True
-            if posts and posts[0]["id"] in seen:
-                seen.remove(posts[0]["id"])
-        seen_set = set(seen)
-        new = sorted([p for p in posts if p["id"] not in seen_set],
-                     key=lambda x: x["ts"])
-        sent = []
-        for p in new:
-            t_send = time.time()
-            if send_post(p, pg):
-                seen.append(p["id"])
-                sent.append((p, t_send))
-            else:
-                warn(f"⚠️ A new post was found but could not be sent to Telegram "
-                     f"({LAST_TG_ERROR or 'unknown error'}). Retrying on the next check.")
-        ps["seen"] = seen
-        ps["last_check"] = int(time.time())
-        phase, interval = watch_phase(cfg, time.time())
-        save_status(st2, phase, interval)
-        save_state(st2)
-        hit = [(p, t) for p, t in sent if matches(p)]
-        if hit:
-            p, t_send = hit[0]
-            delay = t_send - p["ts"]
-            when = (f"published {_hms(p['ts'])}, sent {_hms(t_send)}, "
-                    f"delay {int(delay)}s" if 0 <= delay < 3600
-                    else f"sent {_hms(t_send)}")
-            S["found"] = (f"🎯 New post detected and sent ({when}).")
-            return "found"
-        return "ok"
-
-    def do_check(active):
-        S["checks"] += 1
-        b = S["browser"]
-        r = b.fetch(cfg["fetch_timeout"])
-        kind = r[0] if r else "hang"
-        if kind == "page":
-            _, html_text, url = r
-            if url_is_blocked(url):
-                block(load_state(), "Cookies expired or Facebook asked for login / "
-                                    "identity confirmation (checkpoint) during watch "
-                                    "mode.", time.time())
-                return "blocked"
-            posts = extract_posts(html_text)[0][:MAX_POSTS]
-            if posts:
-                S["consec_err"] = 0
-                return handle_posts(posts, active)
-            reason = "no posts could be read from the page"
-        elif kind == "hang":
-            reason = f"the browser did not answer for {cfg['fetch_timeout']}s"
-        elif kind == "dead":
-            reason = "the browser process died"
-        else:  # err / fatal
-            reason = r[1] if len(r) > 1 else kind
-        S["consec_err"] += 1
-        hard = kind in ("hang", "dead", "fatal") or S["consec_err"] >= 3
-        if hard:
-            b.kill()
-            S["browser"] = None
-            S["restarts"] += 1
-            S["consec_err"] = 0
-            warn(f"⚠️ Watch: {reason}. Restarting the browser, checking continues.")
-            return "retry"
-        warn(f"⚠️ Watch: check failed ({reason}). Trying again in a moment.")
-        return "retry_soon"
-
-    def start_browser():
-        b = make_watch_browser(cookie_list, pg["url"])
-        if b.wait_ready(60):
-            S["browser"] = b
-            return True
-        b.kill()
-        S["restarts"] += 1
-        warn("⚠️ Watch: the browser could not start. Trying again.")
-        return False
-
-    final = None
-    next_check = 0.0
-    print(f"watch: page {pg['id']} | start {_hms(cfg['start'])} | fast "
-          f"{_hms(cfg['fast_from'])}-{_hms(cfg['fast_to'])} | end {_hms(cfg['end'])} | "
-          f"every {cfg['slow_sec']}s / {cfg['fast_sec']}s")
     try:
-        while True:
-            now = time.time()
-            if now >= cfg["end"]:
-                final = "ended"
-                break
-            phase, interval = watch_phase(cfg, now)
-
-            # ---- paused by /pause: close the browser, keep listening
-            if load_state().get("paused"):
-                if S["browser"]:
-                    ck = S["browser"].stop()
-                    S["browser"] = None
-                    if ck:
-                        st3 = load_state()
-                        st3["cookies"] = normalize_cookies(ck)
-                        save_state(st3)
-                if not S["paused"]:
-                    S["paused"] = True
-                    announce("⏸ Watch paused: no checks are made. Send /resume to continue.")
-                _poll(min(25, cfg["end"] - now))
-                continue
-            if S["paused"]:
-                S["paused"] = False
-                if now >= cfg["start"]:
-                    S["phase"] = phase  # the "resumed" message already tells it
-                next_check = 0.0
-                announce(f"▶️ Watch resumed: checking every {interval}s.")
-
-            # ---- waiting for the warm-up moment
-            warm_ts = cfg["start"] - cfg["warmup"]
-            if now < warm_ts:
-                _poll(min(25, warm_ts - now))
-                continue
-            if S["browser"] is None:
-                if not start_browser():
-                    _poll(min(5, cfg["end"] - time.time()))
-                    continue
-                continue  # re-evaluate the time after the (slow) start
-
-            active = now >= cfg["start"]
-            if active and phase != S["phase"]:
-                if S["phase"] is None:
-                    announce(f"🟢 Started checking {pg['label']} every {interval}s "
-                             f"(until {_hms(cfg['end'])}). Send /pause to stop.")
-                else:
-                    announce(f"{'⚡' if phase == 'fast' else '🔄'} Checking interval "
-                             f"changed: every {interval}s.")
-                S["phase"], S["interval"] = phase, interval
-                next_check = min(next_check, now)  # check right at the boundary
-
-            due = (active and now >= next_check) or (not active and not S["baselined"])
-            if due:
-                t0 = time.time()
-                res = do_check(active)
-                if res in ("found", "blocked"):
-                    final = res
-                    break
-                if res == "retry":
-                    next_check = 0.0
-                elif res == "retry_soon":
-                    next_check = time.time() + 2
-                elif active:
-                    next_check = t0 + interval
-                continue
-
-            # ---- sleep until the next check or the next phase boundary
-            targets = [cfg["end"]]
-            if active:
-                targets.append(next_check)
-            else:
-                targets.append(cfg["start"])
-            targets += [t for t in (cfg["fast_from"], cfg["fast_to"]) if t > now]
-            _poll(min(25, max(0.0, min(targets) - time.time())))
+        cookie_list = st.get("cookies") or parse_cookies(get_raw_cookies())
+        w = Watch(cfg, pg, cookie_list, test or env("WATCH_TEST") == "1")
+        # first thing: tell the owner exactly what will happen and when
+        w.announce(watch_plan_text(cfg, pg))
+        w.run()
     finally:
         watchdog.cancel()
-        b = S["browser"]
-        if b:
-            ck = b.stop()
-            if ck:
-                st3 = load_state()
-                st3["cookies"] = normalize_cookies(ck)
-                save_state(st3)
-
-    summary = f"{S['checks']} checks, {S['restarts']} browser restart(s)"
-    if final == "found":
-        announce(f"{S['found']}\n✅ Watch finished ({summary}).")
-    elif final == "ended":
-        announce(f"⏹ Watch window ended at {_hms(cfg['end'])} without a "
-                 f"{'matching ' if cfg['keywords'] else ''}new post ({summary}).")
-    print(f"watch: finished ({final}); {summary}")
 
 
+# ################################################################
+# 12) ENTRY POINTS
+# ################################################################
 def run_cron(test=False):
     """Railway Cron entry: one run, then the process exits (stops billing)."""
     if WATCH_MODE:
@@ -1636,6 +1911,8 @@ def main():
     if not OWNER_ID:
         print("WARNING: TG_OWNER_ID is not set - reports and alerts will be "
               "sent to TG_CHAT_ID (the group) instead.")
+    print(f"Reports: {'ON' if reports_enabled() else 'OFF (posts only)'} | "
+          f"Mode: {'WATCH' if WATCH_MODE else 'normal'}")
 
     try:
         if a.debug:
